@@ -1,0 +1,1 @@
+This folder contains the diagrams for algorithm and it's step by steptransitions
