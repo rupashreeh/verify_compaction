@@ -136,38 +136,6 @@ stateDiagram-v2
     end note
 ```
 
-The example below follows six log files shared by two column families. Before the flush, one
-unflushed record of CF2 in log 2 keeps logs 2 to 5 alive, so all of them count toward the WAL size
-limit; log 3 has no unflushed data at all but is still kept, because a log file is retired only once
-every older one is. After CF2 is flushed, logs 2 and 3 become obsolete: they stop counting toward the
-limit, but they still use disk until the background cleanup removes them.
-
-```mermaid
-flowchart TB
-    subgraph BEFORE["Before: AccountedWALBytes > limit, two CFs share the log. N_CF2 = 2, N_CF1 = 4, MinLogToKeep = 2"]
-        direction LR
-        b1["<b>Log 1</b> · Obsolete<br/>CF1 flushed, CF2 flushed"]
-        b2["<b>Log 2</b> · Closed · live<br/>CF1 flushed, <b>CF2 unflushed</b><br/>← N_CF2 = 2"]
-        b3["<b>Log 3</b> · Closed · live<br/>CF1 flushed<br/><i>live but not needed</i>"]
-        b4["<b>Log 4</b> · Closed · live<br/><b>CF1 unflushed</b><br/>← N_CF1 = 4"]
-        b5["<b>Log 5</b> · Active · live<br/><b>CF1 unflushed</b>"]
-        b1 --- b2 --- b3 --- b4 --- b5
-    end
-    STEP["CheckWALPressure: the oldest log = Log 2, S = {c : N_c ≤ 2} = {CF2}<br/>SwitchMemtable({CF2}) rotates to Log 6; CF2 flush installs: N_CF2 ← 6"]
-    subgraph AFTER["After the flush commits: MinLogToKeep = min(4, 6) = 4"]
-        direction LR
-        a1["<b>Log 1</b> · Deleted"]
-        a2["<b>Log 2</b> · Obsolete<br/>still uses disk"]
-        a3["<b>Log 3</b> · Obsolete<br/>still uses disk"]
-        a4["<b>Log 4</b> · Closed · live<br/><b>CF1 unflushed</b><br/>← N_CF1 = 4"]
-        a5["<b>Log 5</b> · Closed · live<br/><b>CF1 unflushed</b>"]
-        a6["<b>Log 6</b> · Active · live<br/>← N_CF2 = 6"]
-        a1 --- a2 --- a3 --- a4 --- a5 --- a6
-    end
-    BEFORE --> STEP --> AFTER
-```
-
-
 ## WAL Pressure with a Shared Log
 
 All column families write into the same log files, so one log file can hold writes from several of
