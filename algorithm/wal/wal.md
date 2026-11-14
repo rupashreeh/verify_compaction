@@ -186,3 +186,22 @@ flowchart TD
     C -- "yes" --> L["Flush the rebuilt memtables to SSTs (unless configured to keep them),<br/>start a new log file, retire the old ones"]
     L --> O(["Open for writes"])
 ```
+
+## WAL Algorithms
+
+| Algorithm | Procedure | What it does |
+|---|---|---|
+| WAL1 | `Admit(G; T, B)` | Runs any due flush, waits out stalls, admits a write group |
+| WAL2 | `AppendGroup(G)` | Assigns sequence numbers and appends the group as one log record |
+| WAL3a | `FlushWAL(ℓ)` | Pushes log bytes to the operating system |
+| WAL3b | `SyncWALs()` | Forces every live log file, and its directory entry, onto disk |
+| WAL4a | `InsertGroup(G; T)` | Inserts the group into the memtables, marks full memtables |
+| WAL4b | `PublishGroup(G)` | Makes the group visible to readers and answers the clients |
+| WAL5 | `CheckWALPressure(; T)` | Forces a flush when the shared log is over its size limit |
+| WAL6a | `SwitchMemtable(S; T)` | Freezes memtables and starts a new log file |
+| WAL6b | `RequestFlush(S, cause; T)` | Freezes memtables and schedules their flush, recording the cause |
+| WAL7a | `BeforeFlushInstall(S; T)` | Syncs closed log files before a flush is installed |
+| WAL7b | `AfterFlushInstall(S, mems; T)` | Records a completed flush and retires logs |
+| WAL8a | `MarkObsolete(; T)` | Marks closed log files below MinLogToKeep obsolete |
+| WAL8b | `DisposeLog(ℓ)` | Archives, recycles, or deletes an obsolete log file |
+| WAL9 | `Recover(θ; T)` | Replays the needed log files after a crash |
