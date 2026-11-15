@@ -108,3 +108,86 @@ stateDiagram-v2
     Dropped --> Gone: last handle released, memtables and files deleted (CF3)
     Gone --> [*]
 ```
+
+## Creating and Ingesting SST Files
+
+`SstFileWriter` (SST1) builds a sorted SST file outside the store. Keys must be added in strictly
+increasing order. Range deletions are the only exception. Every key in the file has sequence number 0.
+
+Ingestion (SST2) brings one or more of these files into one or more column families. Either every file
+goes in, or none does. The steps are:
+
+1. Copy or link the files into the store and check them.
+2. Stop new writes, and wait for writes already in progress to finish.
+3. Flush any memtable whose keys fall inside a file's key range.
+4. Pick a level for each file (SST3). It goes as deep as it fits, but never below a level that already
+   has one of its keys.
+5. Pick a sequence number for each file (SST3). If the file overlaps existing data, or a snapshot is
+   open, it gets the next sequence number, so it is newer than what it overlaps. Otherwise it keeps 0.
+6. Record every file in one MANIFEST update (SST4), then let writes resume.
+
+With `ingest_behind`, a file goes to the bottom level with sequence number 0. Any existing version of a
+key then wins over it.
+
+```mermaid
+flowchart TD
+    A["Copy or link the files in and check them (step 1)"] --> B["Stop writes and wait for writes in progress (step 2)"]
+    B --> C{"Does a file overlap<br/>a memtable?"}
+    C -- "yes" --> D["Flush that memtable and wait (WAL6b, MT5, MT6)"]
+    C -- "no" --> E
+    D --> E["Pick a level for each file (SST3)"]
+    E --> F{"Overlaps existing data,<br/>or a snapshot is open?"}
+    F -- "yes" --> G["Sequence number = last + 1"]
+    F -- "no" --> H["Sequence number = 0"]
+    G --> I["One MANIFEST update for every file (SST4)"]
+    H --> I
+    I --> J(["Resume writes"])
+    A -. "any error" .-> X(["Delete the copies; nothing is ingested"])
+```
+
+## Algorithms 
+
+T is the LSM tree, M a memtable,
+c a column family, k a key, s a sequence number, F a file, and h a handle.
+
+| Algorithm | Procedure | What it does |
+|---|---|---|
+| MT1 | `M.Insert(r)` | Adds a write to the memtable (called by WAL4a) |
+| MT2 | `M.Get(k, s)` | Finds the newest version of a key in one memtable |
+| MT3 | `M.ShouldFlush()`, `M.IsEmpty()` | Says whether the memtable is full, or empty |
+| MT4 | `T.SealMutable(c, n)` | Freezes the memtable and starts a new one (called only by WAL6a) |
+| MT5 | `T.FlushJob(c)` | Writes frozen memtables to an L0 SST file |
+| MT6 | `T.InstallFlush(c)` | Installs finished flushes in order and moves N_c forward |
+| MT7 | `T.Get(c, k, s)` | Reads a key: memtables first, then L0, then each level |
+| CF1 | `T.CreateColumnFamily(name, opts)` | Creates an empty column family |
+| CF2 | `T.DropColumnFamily(h)` | Drops a column family; its data stays readable until CF3 |
+| CF3 | `T.ReleaseHandle(h)` | Deletes a dropped column family's data when the last handle goes |
+| CF4 | `Open(dir, descs, readOnly)` | Opens the store; read-write opens must list every column family |
+| CF5 | `T.NewIterators(hs, s)` | Iterates several column families at the same point in time |
+| SST1 | `SstFileWriter` | Writes an SST file outside the store |
+| SST2 | `T.IngestExternalFiles(args)` | Ingests files into one or more column families, all or nothing |
+| SST3 | `T.AssignLevelAndSeqno(c, F, s)` | Picks a file's level and sequence number |
+| SST4 | `T.CommitIngestion(placed)` | Records every ingested file in one MANIFEST update |
+
+## Invariants
+
+Three invariants matter for compaction. Each one shapes the files compaction receives.
+
+- **MS3, newer above older.** In the order a read checks things (memtable, frozen memtables, L0
+  newest first, then L1, L2, ...), a later place never holds a newer version of a key than an earlier
+  place. Compaction relies on this when it merges files: it keeps the version with the highest
+  sequence number. If this rule broke, a merge could keep an old value. Keeping it has a cost: a freeze
+  waits for writes still being inserted, finished flushes wait to be installed oldest first, and an
+  ingested file may force a flush or need a new sequence number.
+- **MS6, sorted levels.** In L1 and deeper, files in the same level never overlap. Compaction relies on
+  this to pick its input files by key range. Keeping it has a cost: an ingested file that does not fit
+  in a deep level goes higher up, often to L0, which adds L0 files.
+- **MS7, safe log numbers.** N_c never moves past a log file that an unflushed memtable of c still
+  needs. This decides which log files stay live. Live log files count toward `max_total_wal_size`, so
+  this decides when WAL pressure forces small, early flushes, and so when small L0 files appear. It has
+  no run-time cost.
+
+The other four invariants are about what readers see, and they do not change the files compaction
+receives. A read returns the latest committed value (MS1). A snapshot keeps showing what was committed
+when it was taken (MS2). A batch across column families is visible in all of them or in none (MS4). An
+ingestion lands in all of its column families or in none (MS5).
