@@ -31,27 +31,80 @@ A memtable (M) is a sorted buffer in memory. It can insert, look up a key, and s
 
 The WAL is the log described in algorithm/wal/wal.md
 
-## MemTable LifeCycle 
+## Memtable Life Cycle
 
-A memtable starts empty and takes writes until a flush is triggered. During flush it is frozen and joins the queue of frozen memtables. A background job writes it to an SST file. The result is installed only after every older frozen memtable of the same column family is installed. Post that, the memtable is freed, or kept for a while if max_write_buffer_size_to_maintain asks for it.
+Each column family has one active memtable at a time. A memtable goes through five stages:
 
-If too many frozen memtables are waiting (max_write_buffer_number), writes stall until a flush finishes.
+1. **Active.** It takes new writes and answers reads.
+2. **Frozen.** A flush was triggered. It takes no more writes, but still answers reads. A new, empty
+   memtable becomes active in the same step, and the WAL starts a new log file (MT4, called from WAL6a).
+3. **Flushing.** A background job is writing it to an SST file (MT5). If the write fails, the memtable
+   goes back to Frozen and is tried again later.
+4. **Waiting to install.** Its SST file is written, but older frozen memtables are not installed yet.
+   Files are installed strictly oldest first.
+5. **Installed.** Its SST file is now in L0, and the MANIFEST says so (MT6). The memtable is no longer
+   needed. It is freed once no reader is using it.
+
+Until the memtable is installed, reads still check it.
+
+Two settings change this picture. If too many frozen memtables pile up (`max_write_buffer_number`),
+new writes wait until a flush finishes. If `max_write_buffer_size_to_maintain` is set, some installed
+memtables are kept in memory for a while instead of being freed.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Active" as A
+    state "Frozen" as F
+    state "Flushing" as FL
+    state "Waiting to install" as W
+    state "Installed" as I
+    [*] --> A: created
+    A --> F: flush triggered
+    F --> FL: flush job starts
+    FL --> F: write failed
+    FL --> W: SST file written
+    W --> I: all older ones installed
+    I --> [*]: freed
+```
+
+## Flush Triggers
+
+| Trigger | Detected by | What is flushed |
+|---|---|---|
+| A memtable is full (`write_buffer_size`) | MT3, called in WAL4a | that column family |
+| All memtables together are over `db_write_buffer_size` | the write buffer manager, in WAL1 | the column family with the oldest memtable |
+| The log files are over `max_total_wal_size` | WAL5 | every column family that needs the oldest log file |
+| The user calls `Flush` | the user | the named column families |
+| An ingested file overlaps a memtable | SST2 | that column family |
+
+The wiki says the write buffer manager flushes the *largest* memtable. We believe the current RocksDB
+code (`HandleWriteBufferManagerFlush`) flushes the *oldest* one, and this design follows that. This
+should be checked against the RocksDB version being studied.
+
+## Column Families
+
+A column family is a separate key space inside one store. Every key belongs to exactly one. The
+"default" column family always exists and cannot be dropped.
+
+Column families share the WAL and the sequence numbers. They share nothing else. Sharing the WAL
+makes a batch that writes to several column families atomic. Sharing sequence numbers gives
+iterators over several column families one consistent view (CF5). Because memtables and files are
+separate, each column family can be tuned, flushed, and dropped on its own.
+
+Sharing the log has a cost. Any freeze, in any column family, starts a new log file for all of them.
+A log file can be deleted only after every column family has flushed the writes in it. So a column
+family that is rarely written keeps old log files alive, until WAL pressure forces it to flush.
+
+When a column family is dropped, it stops taking writes and stops holding on to log files. Its data
+stays readable through any handle that is still open. The data is deleted when the last handle is
+released. A read-write open must list every column family in the store.
 
 ```mermaid
 stateDiagram-v2
     direction TB
-    [*] --> Mutable: column family created (CF1) or previous memtable frozen (MT4)
-    Mutable --> Sealed: a flush is triggered, the WAL starts a new log file (WAL6a, MT4)
-    Sealed --> Building: a flush job picks it, oldest first (MT5)
-    Building --> Sealed: the write failed, retried later (MT5)
-    Building --> Built: the SST file is written and synced (MT5)
-    Built --> Installed: every older memtable is installed, MANIFEST updated (MT6)
-    Installed --> History: kept for max_write_buffer_size_to_maintain (MT6)
-    Installed --> [*]: freed when no reader holds it
-    History --> [*]: freed when history is long enough
-
-    note right of Sealed
-        Sealed, Building and Built memtables
-        still answer reads (MT7), newest first
-    end note
+    [*] --> Live: created with N_c = active log (CF1), or "default" at open
+    Live --> Dropped: dropped, no new writes, no longer holds log files (CF2)
+    Dropped --> Gone: last handle released, memtables and files deleted (CF3)
+    Gone --> [*]
 ```
