@@ -1,0 +1,18 @@
+strict digraph DiskGraph {
+node [shape=box,style=rounded]
+edge [colorscheme="paired12"]
+nodesep=0.35;
+subgraph cluster_graph {
+color="white";
+836476720489828731 [label="/\\ nextSeq = 1\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<>>, <<>>, <<>>>>",style = filled]
+836476720489828731 -> -3944789781663776823 [label="AppendWrite",color="2",fontcolor="2"];
+-3944789781663776823 [label="/\\ nextSeq = 2\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1>>, <<>>, <<>>>>",tooltip="/\\ nextSeq = 2\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1>>, <<>>, <<>>>>"];
+-3944789781663776823 -> 2853084494873376048 [label="AppendWrite",color="2",fontcolor="2"];
+2853084494873376048 [label="/\\ nextSeq = 3\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1, 2>>, <<>>, <<>>>>",tooltip="/\\ nextSeq = 3\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1, 2>>, <<>>, <<>>>>"];
+2853084494873376048 -> -1356629925488088093 [label="AppendWrite",color="2",fontcolor="2"];
+-1356629925488088093 [label="/\\ nextSeq = 4\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1, 2, 3>>, <<>>, <<>>>>",tooltip="/\\ nextSeq = 4\n/\\ lstate = <<\"Active\", \"Unused\", \"Unused\">>\n/\\ active = 1\n/\\ logs = <<<<1, 2, 3>>, <<>>, <<>>>>"];
+{rank = same; 836476720489828731;}
+{rank = same; -3944789781663776823;}
+{rank = same; 2853084494873376048;}
+}
+}
