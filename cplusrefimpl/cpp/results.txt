@@ -1,0 +1,111 @@
+== test_basic
+  ok   PutGetDelete
+  ok   FlushMovesDataToL0AndAdvancesLogNumber
+  ok   MemtableFullTriggersFlushAtNextAdmit
+  ok   ReadPathNewestFirst
+  ok   SnapshotsSeeTheirPointInTime
+  ok   ColumnFamiliesShareTheLog
+  ok   WalPressureFlushesTheCfHoldingTheOldestLog
+  ok   WriteBufferManagerFlushesOldestMemtable
+  ok   WriteStallStopsAndResumes
+  ok   OutOfOrderFlushJobsInstallInOrder
+  ok   DropKeepsDataUntilLastHandle
+  ok   OpenMustNameEveryColumnFamily
+  ok   IteratorsAcrossColumnFamiliesShareOnePointInTime
+  ok   SstFileWriterRequiresSortedKeys
+  ok   IngestNonOverlappingGoesDeepWithSeqnoZero
+  ok   IngestOverlappingMemtableFlushesFirstAndGetsSeqno
+  ok   IngestWithOpenSnapshotGetsSeqno
+  ok   IngestBehindGoesToBottomAndLoses
+  ok   IngestAtomicAcrossColumnFamilies
+  ok   IngestRejectsOverlappingFilesInOneCf
+  ok   LevelPlacementStaysAboveOverlap
+21 tests, 0 failed
+== test_crash
+  ok   SyncWriteSurvivesPowerFailure
+  ok   UnsyncedWriteLostOnPowerFailureButNotOnProcessCrash
+  ok   ManualWalFlushLosesBufferedBytesOnProcessCrash
+  ok   TornTailStopsPointInTimeReplay
+  ok   RecoveryModes
+  ok   WalHoleCaughtByPredecessorCheck
+  ok   AvoidFlushDuringRecoveryAcrossTwoCrashes
+  ok   MidRecoveryFlush
+  ok   RecoverySkipsFlushedRecordsPerColumnFamily
+  ok   DroppedColumnFamilyIsNotRecovered
+  ok   IngestionIsAtomicAcrossACrash
+  ok   WalSyncFailureIsPermanentUntilReopen
+  ok   FlushFailureIsRetriedAfterResume
+  ok   ObsoleteLogsAreArchivedOrRecycled
+    900 recoveries checked
+  ok   RandomPowerFailuresKeepPrefixAndDurability
+15 tests, 0 failed
+== test_bugs
+    off -> RecoveryDurable: acknowledged sync write 2 (b) was lost
+  ok   Bug_SyncActiveOnly
+    off -> RecoveryDurable: acknowledged sync write 2 (b) was lost
+  ok   Bug_NoDirSync
+    off -> MT5/MT6 flush jobs: Coverage (I4): write 2 of CF 0 is in log 1 < N_c = 2 but not in an SST
+  ok   Bug_NoWaitInserts
+    off -> RecoveryPrefix: write 2 survived but earlier write 1 was lost
+  ok   Bug_NoSyncClosed
+    off -> RecoveryDurable: acknowledged sync write 2 (c) was lost
+  ok   Bug_NoResume
+    off -> RecoveryDurable: acknowledged sync write 3 (c) was lost
+  ok   Bug_NoResumeAtRecoveryLog
+    off -> RecoveryPrefix: write 2 survived but earlier write 1 was lost
+  ok   Bug_NoSyncRecoveredLogs
+    off -> RecoveryPrefix: write 2 survived but earlier write 1 was lost
+  ok   Bug_NoPredecessorCheck
+    off -> RecoveryOpens: WAL9 refused to open: Corruption: an SST holds data beyond the point where replay stopped
+  ok   Bug_ApproxPITCheck
+    off -> WAL4a InsertGroup: MS3 NewerShadowsOlder: CF 0 key k has seq 2 in read-path component 1 below an older seq 1
+  ok   Bug_SealNoWait
+    off -> MT5/MT6 flush jobs: MS1 ReadLatest: CF 0 key k reads nothing, expected 'visible'
+  ok   Bug_DropUnpublishedShadowed
+    off -> MT6 InstallFlush: MS7 LogNumberSafe: CF 0 N_c = 3 > memLog of an unflushed sealed memtable 1
+  ok   Bug_InstallOutOfOrder
+    off -> WAL4b PublishGroup: MS1 ReadLatest: CF 0 key k reads nothing, expected 'v'
+  ok   Bug_PublishEarly
+    off -> CF2 DropColumnFamily: MS1 ReadLatest: CF 1 key k reads nothing, expected 'v'
+  ok   Bug_DropDeletesNow
+    off -> SST2 IngestExternalFiles: MS1 ReadLatest: CF 0 key k reads 'old', expected 'new'
+  ok   Bug_NoFlushOverlap
+    off -> Compaction: MS1 ReadLatest: CF 0 key k reads 'old', expected 'new'
+  ok   Bug_NoGlobalSeqno
+    off -> SST2 IngestExternalFiles: MS1 ReadLatest: CF 0 key k reads 'old', expected 'new'
+  ok   Bug_LevelBelowOverlap
+    off -> SST2 IngestExternalFiles: MS4 BatchAtomic: batch 1 (seq 1..2) is visible but not inserted into every CF
+  ok   Bug_NoBlockWrites
+    off -> SST4 (one CF of a non-atomic ingestion): MS5 IngestAllOrNothing: ingestion 1 is in 1 of 2 CFs
+  ok   Bug_NonAtomicMultiIngest
+    off -> SST2 IngestExternalFiles: MS2 SnapshotRead: CF 0 key a at snapshot 1 reads '1', expected nothing
+  ok   NoSnapshotConsistency
+20 tests, 0 failed
+== test_random
+    default                          150 runs x 400 steps: no violation
+    avoid_flush_during_recovery      150 runs x 400 steps: no violation
+    allow_ingest_behind              150 runs x 400 steps: no violation
+    merge two memtables per flush    150 runs x 400 steps: no violation
+    recycle and archive logs         150 runs x 400 steps: no violation
+  ok   RandomInterleavingsAllMechanismsOn
+    FixSyncAllLogs off           run 53, step 195: RecoveryDurable: acknowledged sync write 15 (k4) was lost
+    FixDirSync off               run 354, step 124: RecoveryDurable: acknowledged sync write 9 (k3) was lost
+    FixWaitPendingInserts off    run 1, step 277: MT5/MT6 flush jobs: Coverage (I4): write 24 of CF 1 is in log 13 < N_c = 14 but not in an SST
+    FixSyncClosedOnFlush off     run 104, step 81: RecoveryPrefix: write 3 survived but earlier write 1 was lost
+    FixResumeRule off            not found
+    track_and_verify_wals off    run 711, step 84: RecoveryPrefix: write 5 survived but earlier write 4 was lost
+    approx_pit_check on          run 327, step 351: RecoveryOpens: WAL9 refused to open: Corruption: an SST holds data beyond the point where replay stopped
+    FixInstallInOrder off        not found
+    FixFlushOverlap off          run 1, step 260: SST2 IngestExternalFiles: MS1 ReadLatest: CF 2 key k4 reads 'v47', expected 'i66'
+    FixGlobalSeqno off           run 1, step 141: SST2 IngestExternalFiles: MS3 NewerShadowsOlder: CF 0 key k1 has seq 9 in read-path component 2 below an older seq 0
+    FixLevelAbove off            run 1, step 141: SST2 IngestExternalFiles: MS1 ReadLatest: CF 0 key k0 reads 'v2', expected 'i35'
+    FixBlockWrites off           run 1, step 165: SST2 IngestExternalFiles: MS1 ReadLatest: CF 2 key k4 reads 'v47', expected 'i44'
+    FixAtomicMultiIngest off     run 1, step 141: SST4 (one CF of a non-atomic ingestion): MS5 IngestAllOrNothing: ingestion 1 is in 1 of 2 CFs
+    FixPublishAfterInserts off   run 1, step 29: WAL4b PublishGroup: MS1 ReadLatest: CF 0 key k0 reads nothing, expected 'v2'
+    FixDeferDropDelete off       run 1, step 346: CF2 DropColumnFamily: MS1 ReadLatest: CF 1 key k1 reads nothing, expected 'v64'
+    FixKeepUnpublishedShadowed off run 9, step 205: MT5/MT6 flush jobs: MS1 ReadLatest: CF 0 key k2 reads nothing, expected 'v20'
+    FixSyncRecoveredLogs off     run 21, step 109: RecoveryPrefix: write 6 survived but earlier write 2 was lost
+    FixResumeAtRecoveryLog off   run 31, step 185: RecoveryOpens: WAL9 refused to open: Corruption: an SST holds data beyond the point where replay stopped
+    found 16 of 18
+  ok   RandomInterleavingsFindEachBug
+2 tests, 0 failed
