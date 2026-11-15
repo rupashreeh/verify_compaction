@@ -21,3 +21,37 @@ Each write gets a sequence number that says how new it is. Newer data always sit
 A memtable lives in memory, so a crash would lose every write that has not been flushed yet. The write-ahead log (WAL) fixes this. Each write goes to a log file on disk before it goes into the memtable. If the store crashes, it replays the log to rebuild the memtables. Once a memtable has been flushed to an SST, its log records are no longer needed, and old log files can be deleted. The WAL is specified separately (algorithm/wal/wal.md)
 
 
+## System Model
+
+The LSM tree (T) holds everything for each column family: the active memtable, the frozen memtables, and the SST files. L0 files may overlap each other and are kept newest first. In L1 and deeper, the files of one level never overlap.
+
+The MANIFEST is a file that records which column families and SST files exist, each column family's log number N_c, and the last sequence number used. Every change to it is written in one step, all or nothing, after the files it mentions are safely on disk.
+
+A memtable (M) is a sorted buffer in memory. It can insert, look up a key, and say whether it is full or empty.
+
+The WAL is the log described in algorithm/wal/wal.md
+
+## MemTable LifeCycle 
+
+A memtable starts empty and takes writes until a flush is triggered. During flush it is frozen and joins the queue of frozen memtables. A background job writes it to an SST file. The result is installed only after every older frozen memtable of the same column family is installed. Post that, the memtable is freed, or kept for a while if max_write_buffer_size_to_maintain asks for it.
+
+If too many frozen memtables are waiting (max_write_buffer_number), writes stall until a flush finishes.
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> Mutable: column family created (CF1) or previous memtable frozen (MT4)
+    Mutable --> Sealed: a flush is triggered, the WAL starts a new log file (WAL6a, MT4)
+    Sealed --> Building: a flush job picks it, oldest first (MT5)
+    Building --> Sealed: the write failed, retried later (MT5)
+    Building --> Built: the SST file is written and synced (MT5)
+    Built --> Installed: every older memtable is installed, MANIFEST updated (MT6)
+    Installed --> History: kept for max_write_buffer_size_to_maintain (MT6)
+    Installed --> [*]: freed when no reader holds it
+    History --> [*]: freed when history is long enough
+
+    note right of Sealed
+        Sealed, Building and Built memtables
+        still answer reads (MT7), newest first
+    end note
+```
