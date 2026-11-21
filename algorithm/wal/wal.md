@@ -208,3 +208,24 @@ and each call links to its algorithm.
 | WAL8a.pdf  | `MarkObsolete(; T)` | Marks closed log files below MinLogToKeep obsolete |
 | WAL8b.pdf  | `DisposeLog(ℓ)` | Archives, recycles, or deletes an obsolete log file |
 | WAL9.pdf | `Recover(θ; T)` | Replays the needed log files after a crash |
+
+
+## Document underspecification in the Wiki: 
+
+(a) The wiki never says that every logged write must reach its memtable before that memtable is frozen and a new log starts. WAL5 waits until every logged write is in its memtable, and only then calls SwitchMemtable. Without the wait, a write can be in the old log but land in the new memtable; once the old log is deleted, a crash loses a write the client was told was saved.
+
+(b) The wiki never says that, with several column families, the older closed logs must be on disk before a flush is saved in the MANIFEST. WAL7a forces every closed log that is still needed onto disk just before the flush is saved. Without it, a power failure can leave one column family holding a batch that the other column families have lost, which breaks the promise that a batch is all or nothing.
+
+(c) The wiki never says that a frozen memtable is tagged with the new log’s number, or that the column family’s log number changes in the same MANIFEST edit as the flush. WAL6a tags each frozen memtable with num(a), and WAL7b requires that the same MANIFEST save set the column family’s log number to that tag. If the two are saved separately, a crash in between either deletes logs whose writes are in no SST file (lost writes) or replays writes already in an SST file (merge operands applied twice).
+
+(d) The wiki names max_total_wal_size but doesn’t say when it applies or which column families it flushes. WAL5 acts only with more than one column family, acts once per oldest log, and flushes every column family whose log number is at or below that log’s number, even if their memtables are small. Without this, users can’t predict when flushes happen: the logs can grow without limit, or a burst of tiny L0 files can cause extra compaction and write stalls.
+
+(e) The wiki doesn’t separate passing log bytes to the OS from forcing them to disk, and it doesn’t say what happens when either fails. WAL3a passes bytes to the OS, and WAL3b forces them to disk and syncs the log directory once per log; any failure sets bgError, which stops all writes and is never retried. Without this, an implementation can tell a client a write is safe when it is only in the OS cache, lose a whole new log file because the directory was never synced, or retry a failed sync that falsely reports success; in each case a power failure loses acknowledged writes.
+
+(f) The WAL pages don’t explain the difference between a Delay and a Stop, or what happens to noSlowdown writes. WAL1 sleeps once under Delay, waits under Stop until neither T nor B says Stop, and in both cases fails noSlowdown writes with Incomplete. Without this, applications can’t predict write latency, and a client that asked never to wait may block anyway.
+
+(g) The wiki doesn’t say that a write is replayed only if it is not yet in an SST file. WAL9 inserts a write only when its log number is at or past its column family’s log number. Without the check, flushed writes are applied a second time, which wastes work and double-counts merge operands.
+
+(h) The wiki doesn’t say what happens when replay stops early but an SST file already holds newer data. WAL9 returns an error in that case, because the column families would no longer agree on a single point in time. Without the check, the RocksDB store opens with column families at different points in time and gives no error.
+
+(i) The wiki doesn’t say how to tell a stale record left in a recycled log file from a damaged tail. Our WAL9 doesn’t separate them either: it treats such a record as damaged and lets the recovery mode decide. Getting this wrong either brings old data back as if it were new, or treats a healthy log as corrupt, which drops writes or makes the open fail.
