@@ -43,7 +43,7 @@ A write is short. The application waits for a check and five steps. Everything a
 the background. The picture follows one write, `Put(a, 1)` with sync on, into a store whose last
 sequence number is 15.
 
-![The write path of Put(a, 1): check the write controller, number the write, log it, sync the log, insert it in the memtable, publish it, return; later seal, flush, record in the MANIFEST, free the log, and compact](diagrams/excalidraw/writepath.png)
+![The write path of Put(a, 1): check the write controller, number the write, log it, sync the log, insert it in the memtable, publish it, return; later seal, flush, record in the MANIFEST, free the log, and compact](writepath.png)
 
 First the write controller lets the write in, unless the store is behind. It makes the write wait
 when there are too many L0 files or sealed memtables, when compaction has too much work left, or
@@ -69,7 +69,7 @@ A read looks in the newest place first, and stops at the first version of the ke
 picture runs three reads against a small store. The memtable holds `c@15`. L1 holds `a@13` and a
 delete of `b` at 14. L2, the last level, holds `a@3`, `b@5`, and `d@7`.
 
-![The read path: Get(a) finds a@13 in L1; Get(b) finds the delete in L1 and returns not found; Get(d) reaches L2; then the steps of one read and how one SST file is read through the block cache](diagrams/excalidraw/readpath.png)
+![The read path: Get(a) finds a@13 in L1; Get(b) finds the delete in L1 and returns not found; Get(d) reaches L2; then the steps of one read and how one SST file is read through the block cache](readpath.png)
 
 - `Get(a)` misses the memtables and L0, finds `a@13` in L1, and never reads L2.
 - `Get(b)` finds the delete of `b` in L1 and returns "not found". The older `b@5` is hidden.
