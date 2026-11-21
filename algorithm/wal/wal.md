@@ -8,7 +8,7 @@
 
 A key–value store built as an LSM tree keeps its most recent writes in memory, in a sorted
 structure called a memtable. When the process crashes or the machine loses power, every write
-the store has accepted but not yet copied to disk would be lost.
+the RocksDB store has accepted but not yet copied to disk would be lost.
 
 The write-ahead log fixes this by ensuring that before a write goes into the memtable, it
 is appended to a log file on disk. From time to time a full memtable is written to disk as a sorted
@@ -21,7 +21,7 @@ receives, so the specification keeps every WAL behavior that changes them.
 
 ## Tracking the path of a single write
 
-(a) The client submits a write which waits in a queue. If the store is overloaded, it is slowed down or
+(a) The client submits a write which waits in a queue. If the RocksDB store is overloaded, it is slowed down or
 rejected. Otherwise it is admitted (Algorithm WAL1).
 
 (b) The write gets a sequence number, which fixes its place in the global order, and is appended to the
@@ -33,11 +33,11 @@ disk (Algorithm WAL3a and WAL3b).
 (d) The write is inserted into the memtable and then made visible to readers, and the client receives
 the response (Algorithm WAL4a and WAL4b).
 
-(e) When the memtable is full or the shared log has grown past its size limit, a flush is triggered
-(Algorithm WAL5).
+(e) When the memtable is full or memory is tight, a flush is triggered (Algorithm WAL1). When the
+shared log has grown past its size limit, a flush is triggered too (Algorithm WAL5).
 
 (f) The memtable is frozen, a fresh one takes its place, and a new log file is started at the same
-moment (Algorithm WAL6a and WAL6b).
+moment (Algorithm WAL6a). Then a flush of the frozen memtable is scheduled (Algorithm WAL6b).
 
 (g) A background job writes the frozen memtable to disk as an SST file.
 
@@ -47,7 +47,7 @@ just after (Algorithm WAL7a and WAL7b).
 (i) Once no column family needs the old log file, it is marked obsolete and later deleted, archived,
 or recycled (Algorithm WAL8a and WAL8b).
 
-(j) If the machine crashes at any point, the store replays the log files that are still needed to
+(j) If the machine crashes at any point, the RocksDB store replays the log files that are still needed to
 rebuild the memtables (Algorithm WAL9).
 
 ## System Model
@@ -57,7 +57,7 @@ their own algorithms, and the WAL uses them only through a small set of operatio
 keeps the WAL specification short and lets any correct implementation of the other modules
 be plugged in.
 
-The **LSMTree** (written T) is the store itself. It owns the memtables, the SST files, and the
+The **LSMTree** (written T) is the data structure of the RocksDB store. It owns the memtables, the SST files, and the
 MANIFEST, which is the durable record of which SSTs exist. It also remembers, for each
 column family, the oldest log file that family still needs. The WAL asks it questions such as
 "which memtable is current for this column family?" and gives it commands such as "freeze
@@ -95,16 +95,16 @@ LSM tree and is read through its interface.
 - **Q, the writes in flight.** Every write that has been submitted but not yet answered, together with
   how far it has got: queued, admitted, numbered, logged, inserted into the memtable, or visible to
   readers.
-- **D, the writes that are safely in SSTs.** Used only to state and prove correctness; the real store
+- **D, the writes that are safely in SSTs.** Used only to state and prove correctness; the real RocksDB store
   tracks this through each column family's oldest needed log file.
-- **F, the flush requests.** For each request, the column family, why it was asked for (memtable full,
-  memory pressure, WAL size limit, manual, or recovery), and whether it is waiting, scheduled, or done.
+- **F, the flush requests.** For each request, the column family and whether it is requested or
+  committed (the flush is saved in the MANIFEST).
 - **θ, the configuration.** The RocksDB options that change WAL behavior, such as the WAL size limit,
   the write mode, and the recovery mode.
 
 ## Log Life Cycle
 
-A log file is created when the store opens or when a memtable is frozen, and it becomes the active
+A log file is created when the RocksDB store opens or when a memtable is frozen, and it becomes the active
 file that receives every new write from every column family. When the next memtable is frozen, a new
 file takes over and this one is closed, so nothing more is ever written to it. A closed file is kept
 as long as some column family still has unflushed writes in it or in an older file. Once every column
@@ -116,7 +116,7 @@ still use disk until they are deleted.
 ```mermaid
 stateDiagram-v2
     direction TB
-    [*] --> Active: created when the store opens or a memtable is frozen (WAL6a, WAL9)
+    [*] --> Active: created when the RocksDB store opens or a memtable is frozen (WAL6a, WAL9)
     Active --> Closed: memtable frozen, a new log file takes over (WAL6a)
     Closed --> Obsolete: every column family has flushed past it (WAL7b, WAL8a)
     Obsolete --> Deleted: deleted (WAL8b)
@@ -141,7 +141,7 @@ stateDiagram-v2
 All column families write into the same log files, so one log file can hold writes from several of
 them, and it can only be retired when every one of them has flushed. A column family that is written
 rarely therefore keeps old log files alive while the others keep adding new ones. When the active and
-closed log files together grow past the WAL size limit, the store finds the oldest live log file and
+closed log files together grow past the WAL size limit, the RocksDB store finds the oldest live log file and
 flushes every column family that still needs it, even if that memtable is nearly empty (Algorithm
 WAL5). Once that flush is installed, the oldest log files are no longer needed and are retired. This
 rule only applies when there is more than one column family, and it produces small, early L0 files
@@ -163,23 +163,23 @@ flowchart TB
 
 ## Recovery
 
-When the store opens after a crash, it reads the MANIFEST to learn which SST files exist and which
+When the RocksDB store opens after a crash, it reads the MANIFEST to learn which SST files exist and which
 log files each column family still needs. It then reads those log files in order, oldest first, and
 puts each write back into its memtable, skipping any write whose column family had already flushed
-it. In the default point-in-time mode, replay stops at the first damaged or missing record, so the
-store keeps everything before that point and drops everything after it. Before opening, it checks
+it. In the default point-in-time mode, replay stops at the first damaged record, so the
+RocksDB store keeps everything before that point and drops everything after it. Before opening, it checks
 that no SST already holds data from beyond the stopping point, and refuses to open if one does.
 Finally, it flushes the rebuilt memtables to SSTs (unless configured to keep them in memory), starts
 a new log file, retires the old ones, and opens for writes (Algorithm WAL9).
 
 ```mermaid
 flowchart TD
-    S["Store opens after a crash"] --> M["Read the MANIFEST: which SSTs exist<br/>and which log files each column family still needs"]
+    S["The RocksDB store opens after a crash"] --> M["Read the MANIFEST: which SSTs exist<br/>and which log files each column family still needs"]
     M --> R["Read the needed log files in order, oldest first"]
     R --> Q{"Is the next record<br/>intact?"}
     Q -- "yes" --> I["Put it back into its memtable<br/>(skip it if that column family already flushed it)"]
     I --> R
-    Q -- "damaged, or data missing" --> P["Stop replaying: keep everything before this point,<br/>drop everything after it"]
+    Q -- "damaged" --> P["Stop replaying: keep everything before this point,<br/>drop everything after it"]
     Q -- "no more records" --> C
     P --> C{"Do the SSTs agree with<br/>where replay stopped?"}
     C -- "no" --> F(["Refuse to open"])
@@ -189,21 +189,22 @@ flowchart TD
 
 ## WAL Algorithms
 
-The end to end WAL algorithm can be found in WALFullAlgorithm.pdf and it references each smaller algorithm in 
+The end-to-end WAL algorithm is in WALFullAlgorithm.pdf. It calls each of the smaller algorithms below,
+and each call links to its algorithm.
 
 | Algorithm | Procedure | What it does |
 |---|---|---|
 | WAL1.pdf | `Admit(G; T, B)` | Runs any due flush, waits out stalls, admits a write group |
 | WAL2.pdf  | `AppendGroup(G)` | Assigns sequence numbers and appends the group as one log record |
-| WAL3a.pdf  | `FlushWAL(ℓ)` | Pushes log bytes to the operating system |
+| WAL3a.pdf  | `FlushWAL(a)` | Pushes log bytes to the operating system |
 | WAL3b.pdf  | `SyncWALs()` | Forces every live log file, and its directory entry, onto disk |
-| WAL4a.pdf  | `InsertGroup(G; T)` | Inserts the group into the memtables, marks full memtables |
+| WAL4a.pdf  | `InsertGroup(G; T)` | Inserts the group into the memtables |
 | WAL4b.pdf  | `PublishGroup(G)` | Makes the group visible to readers and answers the clients |
 | WAL5.pdf  | `CheckWALPressure(; T)` | Forces a flush when the shared log is over its size limit |
 | WAL6a.pdf  | `SwitchMemtable(S; T)` | Freezes memtables and starts a new log file |
-| WAL6b.pdf  | `RequestFlush(S, cause; T)` | Freezes memtables and schedules their flush, recording the cause |
+| WAL6b.pdf  | `RequestFlush(S; T)` | Schedules a flush of the frozen memtables |
 | WAL7a.pdf  | `BeforeFlushInstall(S; T)` | Syncs closed log files before a flush is installed |
-| WAL7b.pdf  | `AfterFlushInstall(S, mems; T)` | Records a completed flush and retires logs |
+| WAL7b.pdf  | `AfterFlushInstall(S; T)` | Records a completed flush |
 | WAL8a.pdf  | `MarkObsolete(; T)` | Marks closed log files below MinLogToKeep obsolete |
 | WAL8b.pdf  | `DisposeLog(ℓ)` | Archives, recycles, or deletes an obsolete log file |
 | WAL9.pdf | `Recover(θ; T)` | Replays the needed log files after a crash |
