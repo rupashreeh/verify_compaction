@@ -25,7 +25,14 @@ struct Snapshot {
   SeqNo seq;
 };
 
-class DB {
+// A reader's hold on a CF's memtables (RocksDB: a referenced super version, as an
+// iterator keeps). While it lives, the memtables are not destroyed, so B.FreeMem
+// (WBM2) waits for it.
+struct MemtablePin {
+  std::vector<std::shared_ptr<MemTable>> mems;
+};
+
+class DB : public FlushInitiator {
  public:
   // CF4 Open. cfNames must list every CF in the MANIFEST unless readOnly; a missing
   // name is created if create_missing_column_families is set. handles[i] is the id of cfNames[i].
@@ -35,6 +42,7 @@ class DB {
     return Open(env, opts, {"default"}, out);
   }
   DB(SimEnv* env, const Options& opts);
+  ~DB() override;
 
   Status Close();  // clean shutdown: hand buffered log bytes to the OS
 
@@ -51,7 +59,18 @@ class DB {
   Status InsertGroup(WriteGroup& G);                      // WAL4a
   Status InsertBatchCf(WriteGroup& G, size_t i, CfId c);  // WAL4a, one batch into one CF
   Status PublishGroup(WriteGroup& G);                     // WAL4b
-  void AbandonGroup(WriteGroup& G) { wal.Forget(G); }
+  void AbandonGroup(WriteGroup& G) {  // a stalled leader that gives up leaves B's queue (WBM8)
+    if (G.wbmStalled && wbmStall_.state == WbmStall::kBlocked) tree.wbm->RemoveDBFromQueue(&wbmStall_);
+    wal.Forget(G);
+  }
+
+  // ---- the write buffer manager (WBM9 hand-offs come in through FlushInitiator) ----
+  WriteBufferManager& Wbm() { return *tree.wbm; }
+  std::shared_ptr<MemtablePin> PinMemtables(CfId c);
+  size_t FlushableMemory() const override { return tree.FlushableMemory(); }
+  bool WritersStalled() const override { return wbmStall_.state == WbmStall::kBlocked; }
+  bool FlushLargestCf() override;
+  WbmStall* Stall() override { return &wbmStall_; }
 
   // ---- reads ----
   Status Get(CfId c, const std::string& k, std::string* v, const Snapshot* snap = nullptr);  // MT7
@@ -78,10 +97,34 @@ class DB {
   // ---- ingestion and compaction ----
   Status IngestExternalFile(CfId c, const std::vector<std::string>& files, const IngestOptions& o = {});
   Status IngestExternalFiles(const std::vector<IngestArg>& args);  // SST2
-  Status CompactLevel(CfId c, int from);
+  Status CompactLevel(CfId c, int from);  // manual: level from into from + 1, start to finish
+
+  // ---- compaction, one step at a time (LSM5/LSM6 then LSM7 to LSM9) ----
+  uint64_t CompactStart(CfId c);        // pick by the style's policy; 0 if nothing is due
+  Status CompactFinish(uint64_t id);
+  Status MaybeCompact();                // LSM11: run every due compaction now
+
+  // ---- versions (LSM10) ----
+  std::shared_ptr<VersionPin> PinVersion(CfId c);       // an iterator's hold on the files
+  void ReleaseVersion(std::shared_ptr<VersionPin>* p);  // Unref, then purge obsolete files
+  Status ReadPinned(const VersionPin& p, const std::string& k, std::string* v);
+
+  // ---- the RocksDBStore steps (rocksdb_store/rocksdb_store_algorithm.pdf) ----
+  Status CompactWrite(uint64_t id);    // DB6: merge and write the outputs
+  Status CompactInstall(uint64_t id);  // DB7: one MANIFEST record, then the new version
+  Status SyncManifest();               // only without FixSyncBeforeApply: write the applied records
+  Status PurgeAllObsoleteFiles();      // DB8: full scan, keeping pending outputs
+  void UpdateWriteStall();             // DB10: accepting <- not stopped
+  void UpdatePersisted();              // persistedThrough <- what a crash keeps for sure
+  // RocksDBStore.persistedThrough: every logged write and every ingestion with a
+  // sequence number up to here survives any crash.
+  SeqNo persistedThrough = 0;
+  // RocksDBStore.accepting: writes may go on (WAL1 would not stop them).
+  bool accepting = true;
 
   // ---- checking ----
   std::vector<std::string> CheckInvariants() const;  // every invariant, now
+  std::vector<std::string> CheckStore() const;       // ST2 to ST5 (rocksdb_store/)
   void Step(const char* name);  // called after every step; checks if opts.check_invariants
 
   SimEnv* env;
@@ -92,6 +135,7 @@ class DB {
 
  private:
   Status WriteGroupNow(std::shared_ptr<WriteGroup> G);
+  WbmStall wbmStall_;
   std::list<Snapshot> snaps_;
   uint64_t nextBatchId_ = 1, nextGroupId_ = 1;
 };

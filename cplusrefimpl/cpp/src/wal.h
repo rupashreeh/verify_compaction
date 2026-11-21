@@ -20,6 +20,7 @@
 #include "memtable.h"
 #include "options.h"
 #include "sim_env.h"
+#include "write_buffer_manager.h"
 
 namespace lsm {
 
@@ -91,6 +92,7 @@ struct WriteGroup {
   std::vector<std::shared_ptr<BatchState>> batches;
   SeqNo firstSeq = 0, lastSeq = 0;
   bool appended = false, published = false;
+  bool wbmStalled = false;  // its leader waits in WBM5 (write buffer manager stall)
   bool AllInserted() const {
     for (auto& b : batches)
       if (b->stage != BatchStage::kFailed && !b->AllInserted()) return false;
@@ -112,7 +114,15 @@ class Wal {
  public:
   Wal(SimEnv* env, const Options& opts, LsmTree* T) : env_(env), opts_(opts), T_(T) {}
 
+  // The write buffer manager B is an input of WAL1, like T (WAL spec, Section 3).
+  // stall is this DB's handle in B's queue; initiator is this DB, for WBM9.
+  WriteBufferManager* B = nullptr;
+  WbmStall* stall = nullptr;
+  FlushInitiator* initiator = nullptr;
+
   Status Admit(WriteGroup& G);                       // WAL1
+  Status WbmStallWrites(WriteGroup& G);              // WBM5, the end of WAL1
+  Status WbmWait(WriteGroup& G);                     // WBM5 waiting (and WBM9 retries)
   Status AppendGroup(WriteGroup& G);                 // WAL2
   Status FlushWAL(LogFile& l);                       // WAL3a
   Status SyncWALs();                                 // WAL3b

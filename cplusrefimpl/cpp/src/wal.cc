@@ -168,6 +168,9 @@ void Wal::AddRequest(CfId c, FlushCause cause, FlushReqState st) {
 Status Wal::Admit(WriteGroup& G) {
   // when at the head of the write queue, before anything in G is logged
   if (readOnly) return Status::InvalidArgument("read-only DB");
+  if (G.wbmStalled) return WbmWait(G);  // the leader is blocked in WBM5; it does not start over
+  // WBM5 stops new writers of this DB from joining while its leader is stalled
+  if (stall && stall->state == WbmStall::kBlocked) return Status::Busy("waits behind a stalled leader");
   if (bgError) {
     for (auto& b : G.batches) { b->stage = BatchStage::kFailed; b->result = bgStatus; }
     return bgStatus;
@@ -175,12 +178,13 @@ Status Wal::Admit(WriteGroup& G) {
   // WAL5: may force a flush now
   Status s = CheckWALPressure();
   if (!s.ok()) return s;
-  // memory pressure (WriteBufferManager)
-  if (opts_.db_write_buffer_size > 0 && T_->MutableMemoryUsage() > opts_.db_write_buffer_size) {
+  // memory pressure: the write buffer manager (WBM4)
+  if (B && B->ShouldFlush()) {
     auto victims = T_->PickWbmVictims();
     if (!victims.empty()) {
       s = RequestFlush(victims, FlushCause::kWriteBufferManager);  // WAL6b
       if (!s.ok()) return s;
+      B->wbmFlushes++;
     }
   }
   // memtables marked full by WAL4a
@@ -209,6 +213,55 @@ Status Wal::Admit(WriteGroup& G) {
     // instead, and the caller runs background work and calls Admit again.
     return any ? Status::Busy("write stall") : Status::Incomplete("write stall");
   }
+  return WbmStallWrites(G);  // WBM5
+}
+
+// ---------------------------------------------------------------- WBM5 StallWrites
+Status Wal::WbmStallWrites(WriteGroup& G) {
+  if (B && B->ShouldStall()) {
+    bool any = false;
+    for (auto& b : G.batches) {
+      if (b->stage != BatchStage::kQueued) continue;
+      if (b->o.noSlowdown) {
+        b->stage = BatchStage::kFailed;
+        b->result = Status::Incomplete("write buffer manager stall");
+      } else {
+        any = true;
+      }
+    }
+    if (!any) return Status::Incomplete("write buffer manager stall");
+    // stop new writers of this DB from joining the write queue: G stays at its head
+    stall->state = WbmStall::kBlocked;
+    G.wbmStalled = true;
+    B->BeginWriteStall(stall);  // WBM6
+    if (stall->state == WbmStall::kBlocked) return Status::Busy("write buffer manager stall");
+    G.wbmStalled = false;  // WBM6 signaled it at once: the stall had ended
+  }
+  for (auto& b : G.batches)
+    if (b->stage == BatchStage::kQueued) b->stage = BatchStage::kAdmitted;
+  return Status::OK();
+}
+
+// The leader waits for its signal. A real leader blocks; the step engine returns
+// Busy and the caller calls Admit again later. With kFlushLargestAcrossDBs each
+// retry stands for one 20 ms wake-up of WBM9.
+Status Wal::WbmWait(WriteGroup& G) {
+  if (stall->state == WbmStall::kBlocked && B->FlushAcrossDBs(initiator)) {
+    // WBM9 local retry: B removed this DB from its queue; flush here (WBM4), then WBM5 again
+    G.wbmStalled = false;
+    if (B->ShouldStall()) {
+      auto victims = T_->PickWbmVictims();
+      if (!victims.empty()) {
+        Status s = RequestFlush(victims, FlushCause::kWriteBufferManager);  // WAL6b
+        if (!s.ok() && !s.IsBusy()) return s;
+        if (s.ok()) B->wbmFlushes++;
+      }
+    }
+    return WbmStallWrites(G);
+  }
+  if (stall->state == WbmStall::kBlocked) return Status::Busy("write buffer manager stall");
+  // signaled: admit the rest of G without testing again (the limit is soft)
+  G.wbmStalled = false;
   for (auto& b : G.batches)
     if (b->stage == BatchStage::kQueued) b->stage = BatchStage::kAdmitted;
   return Status::OK();

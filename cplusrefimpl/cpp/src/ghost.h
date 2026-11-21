@@ -49,6 +49,11 @@ class Ghost {
     uint64_t t;
     SeqNo seq;
     bool ingest;
+    // Commit order for the rebuild after a crash: 2*seq, but an ingested file
+    // that kept sequence number 0 sorts just after every write issued before it
+    // (a compaction may have dropped every older version of its keys), and an
+    // ingest-behind file before everything.
+    SeqNo ord = 0;
   };
   struct Batch {
     std::set<CfId> cfs, inserted;
@@ -71,11 +76,14 @@ class Ghost {
   void OnIngestPrepare(uint64_t job, const std::set<CfId>& cfs);
   void OnIngestCommit(uint64_t job, const std::vector<LsmTree::Placement>& placed, const std::set<CfId>& done);
   void OnIngestFail(uint64_t job);
+  void OnCompactionDropped(CfId c, const std::vector<std::pair<std::string, SeqNo>>& dels);  // LSM7
   void OnSnapshot(const Snapshot* s);
   void OnReleaseSnapshot(const Snapshot* s);
   void OnCrash();                            // call before re-opening after a crash
   void OnRecovered(const DB& db);            // called by DB::Open after WAL9
   void OnRecoveryFailed(const Status& s);    // called by DB::Open when WAL9 fails
+  void OnPersisted(SeqNo p) { persistedThrough = p; }  // the store's persistedThrough grew
+  SeqNo persistedThrough = 0;  // as the store last reported it; ST1 checks it at recovery
 
   // What a read at logical time t must return (NotFound if absent or deleted).
   bool Expected(CfId c, const std::string& k, uint64_t t, std::string* v) const;
@@ -89,6 +97,10 @@ class Ghost {
   RecResult rec;
   uint64_t flushedRecords = 0;  // |D|
   std::vector<std::string> violations;  // every violation seen so far, with the step
+  // (CF, key) -> the newest deletion that a compaction dropped at the bottom, with
+  // every older version of the key. Those writes are gone on purpose: they count
+  // as covered (I4) and as present (RecoveryPrefix, RecoveryDurable).
+  std::map<std::pair<CfId, std::string>, SeqNo> erased;
 };
 
 std::vector<std::string> CheckInvariants(const DB& db, const Ghost& g);

@@ -1,4 +1,5 @@
-== test_basic
+# make test, g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 2026-11-17
+== build/test_basic
   ok   PutGetDelete
   ok   FlushMovesDataToL0AndAdvancesLogNumber
   ok   MemtableFullTriggersFlushAtNextAdmit
@@ -21,25 +22,7 @@
   ok   IngestRejectsOverlappingFilesInOneCf
   ok   LevelPlacementStaysAboveOverlap
 21 tests, 0 failed
-== test_crash
-  ok   SyncWriteSurvivesPowerFailure
-  ok   UnsyncedWriteLostOnPowerFailureButNotOnProcessCrash
-  ok   ManualWalFlushLosesBufferedBytesOnProcessCrash
-  ok   TornTailStopsPointInTimeReplay
-  ok   RecoveryModes
-  ok   WalHoleCaughtByPredecessorCheck
-  ok   AvoidFlushDuringRecoveryAcrossTwoCrashes
-  ok   MidRecoveryFlush
-  ok   RecoverySkipsFlushedRecordsPerColumnFamily
-  ok   DroppedColumnFamilyIsNotRecovered
-  ok   IngestionIsAtomicAcrossACrash
-  ok   WalSyncFailureIsPermanentUntilReopen
-  ok   FlushFailureIsRetriedAfterResume
-  ok   ObsoleteLogsAreArchivedOrRecycled
-    900 recoveries checked
-  ok   RandomPowerFailuresKeepPrefixAndDurability
-15 tests, 0 failed
-== test_bugs
+== build/test_bugs
     off -> RecoveryDurable: acknowledged sync write 2 (b) was lost
   ok   Bug_SyncActiveOnly
     off -> RecoveryDurable: acknowledged sync write 2 (b) was lost
@@ -81,14 +64,149 @@
     off -> SST2 IngestExternalFiles: MS2 SnapshotRead: CF 0 key a at snapshot 1 reads '1', expected nothing
   ok   NoSnapshotConsistency
 20 tests, 0 failed
-== test_random
+== build/test_cache
+  ok   DefaultShardsAreAtLeast512KB
+  ok   EvictsOldestUnpinnedFirst
+  ok   PinnedBlocksAreNeverEvicted
+  ok   StrictLimitRefusesPinnedInsert
+  ok   HighPriorityPoolSpillsAndIsEvictedLast
+  ok   HitBlockMovesToHighPool
+  ok   ReplacedPinnedEntryIsDetached
+  ok   ErasePinnedEntryFreesItAtRelease
+  ok   ShardsDoNotShareCapacity
+  ok   SetCapacityEvictsButDoesNotTrimPool
+  ok   CompactionReleaseOverCapacityEvicts
+  ok   GetFillsCacheThenHits
+  ok   CompactionDoesNotFillCache
+  ok   StrictCacheFailsReadsButNotCompaction
+  ok   UncacheErasesBlocksOfObsoleteFiles
+  ok   PinnedL0IndexReleasedWhenFileIsObsolete
+  ok   PrepopulateWarmsFlushOutputOnly
+  ok   TwoStoresShareOneCache
+  ok   WbmChargesTheSameCache
+    off -> end: CH4 NoStaleBlock: key file/1/data0 of file 1 returned a block of another file
+  ok   Bug_KeyReuse
+    off -> CH2 PinSafety: eviction freed block a while it was pinned
+  ok   Bug_LookupKeepsOnLRU
+    off -> CH2 PinSafety: a replacing insert freed block k while it was pinned
+  ok   Bug_FreeReplaced
+    off -> CH3 CapacityBound: shard 0: usage=3 > capacity=2 with evictable entries
+  ok   Bug_KeepOverCap
+    off -> CH3 CapacityBound: shard 0: strict cache holds 3 > 2
+  ok   Bug_StrictAdmits
+    off -> CH7 PoolBound: shard 0: high-priority pool holds 3 > 2
+  ok   Bug_NoPoolSpill
+    off -> DB6 CompactWrite (outputs on disk, not yet installed): CH5 CompactionNoFill: shard 1: block s16/1/data1 was inserted by a compaction read
+  ok   Bug_CompactionFills
+    off -> end: CH6 NoLeakedPin: shard 0: block s18/1/data0 has 1 pins but 0 holders
+  ok   Bug_LeakPin
+  ok   RandomOperationsKeepInvariants
+    LookupKeepsOnLRU   CH1 ExactAccounting: shard 0: pinned or erased block k1 is on the LRU list
+    FreeReplaced       CH2 PinSafety: a replacing insert freed block k1 while it was pinned
+    KeepOverCap        CH3 CapacityBound: shard 0: usage=11 > capacity=8 with evictable entries
+    StrictAdmits       CH3 CapacityBound: shard 1: strict cache holds 6 > 4
+    NoPoolSpill        CH7 PoolBound: shard 0: high-priority pool holds 4 > 3
+    found 5 of 5
+  ok   RandomOperationsFindEachBug
+29 tests, 0 failed
+== build/test_compaction
+  ok   LeveledL0TriggerCompactsIntoBaseLevel
+  ok   StaticTargetsGrowByTheMultiplier
+  ok   TrivialMoveKeepsTheFile
+  ok   MergeKeepsTheNewestVersionInEachSnapshotStripe
+  ok   DeletionIsDroppedOnlyAtTheBottom
+  ok   IngestBehindKeepsEveryDeletion
+  ok   CleanCutTakesFilesThatShareAKey
+  ok   ConcurrentCompactionsUseDisjointFilesAndRanges
+  ok   PinnedVersionKeepsItsFiles
+  ok   IngestionStaysAboveARunningCompaction
+  ok   WritesSlowDownThenStop
+  ok   UniversalSizeRatioFollowsTheWikiExample
+  ok   UniversalSizeAmplificationCompactsEverything
+  ok   UniversalOutputGoesJustAboveTheNextOlderRun
+    off -> LSM7-LSM9 compaction (finish): MS3 NewerShadowsOlder: CF 0 key k has seq 2 in read-path component 3 below an older seq 1
+  ok   Bug_L0PartialPick
+    off -> Compaction: MS3 NewerShadowsOlder: CF 0 key a has seq 3 in read-path component 2 below an older seq 2
+  ok   Bug_NoCleanCut
+    off -> Compaction: LS1 LevelsDisjoint (MS6): CF 0 level 1 files 2 and 1 overlap
+  ok   Bug_SkipOutputOverlap
+    off -> LSM5/LSM6 pick (start): LS4 Exclusive: file 2 is an input of compactions 1 and 2
+  ok   Bug_PickBusy
+    off -> Compaction: MS2 SnapshotRead: CF 0 key k at snapshot 2 reads nothing, expected 'v1'
+  ok   Bug_IgnoreSnapshots
+    off -> Compaction: MS1 ReadLatest: CF 0 key k reads 'old', expected nothing
+  ok   Bug_DropTombstoneEarly
+    off -> LSM7-LSM9 compaction (finish): MS3 NewerShadowsOlder: CF 0 key k has seq 23 in read-path component 3 below an older seq 2
+  ok   Bug_NonAdjacentRuns
+    off -> SST2 IngestExternalFiles: MS1 ReadLatest: CF 0 key k reads 'old', expected nothing
+  ok   Bug_IngestBehindDrop
+    off -> Compaction: LS5 PinnedLive: file 2 of a pinned version (CF 0) was deleted
+  ok   Bug_DeleteReferenced
+    off -> LSM7-LSM9 compaction (finish): LS1 LevelsDisjoint (MS6): CF 0 level 2 files 1 and 2 overlap
+  ok   Bug_IngestIntoCompaction
+24 tests, 0 failed
+== build/test_crash
+  ok   SyncWriteSurvivesPowerFailure
+  ok   UnsyncedWriteLostOnPowerFailureButNotOnProcessCrash
+  ok   ManualWalFlushLosesBufferedBytesOnProcessCrash
+  ok   TornTailStopsPointInTimeReplay
+  ok   RecoveryModes
+  ok   WalHoleCaughtByPredecessorCheck
+  ok   AvoidFlushDuringRecoveryAcrossTwoCrashes
+  ok   MidRecoveryFlush
+  ok   RecoverySkipsFlushedRecordsPerColumnFamily
+  ok   DroppedColumnFamilyIsNotRecovered
+  ok   IngestionIsAtomicAcrossACrash
+  ok   WalSyncFailureIsPermanentUntilReopen
+  ok   FlushFailureIsRetriedAfterResume
+  ok   ObsoleteLogsAreArchivedOrRecycled
+    900 recoveries checked
+  ok   RandomPowerFailuresKeepPrefixAndDurability
+15 tests, 0 failed
+== build/test_wbm
+  ok   AccountingFollowsMemtableLifeCycle
+  ok   ReaderPinDelaysFreeMem
+  ok   FlushTriggerMutableOverSevenEighths
+  ok   FlushTriggerOverLimitOnlyIfHalfIsMutable
+  ok   VictimOldestLargestAndSkipPending
+  ok   StallBlocksUntilFreeMemEndsIt
+  ok   SetBufferSizeEndsStall
+  ok   CacheReservationGrowsAtOnceShrinksLate
+  ok   StrictCacheCanLeaveMemoryUncharged
+  ok   TwoDbsIdlePeerOldestStallsForever
+  ok   TwoDbsIdlePeerAcrossDBsHandsOff
+  ok   BigMemtableOldestStallsForever
+  ok   BigMemtableAcrossDBsRetriesLocally
+    off -> WAL6b RequestFlush: BM1 ExactAccounting: active=100 but mutable memtables hold 0
+  ok   Bug_NoScheduleFree
+    off -> MT5/MT6 flush jobs: BM1 ExactAccounting: used=0 but memtables hold 100
+  ok   Bug_FreeWhilePinned
+    off -> MT5/MT6 flush jobs: BM2 NoLostWakeup: DB1 is blocked but used=117 < buffer_size=400
+  ok   Bug_NoEndOnFree
+    off -> after SetBufferSize: BM2 NoLostWakeup: DB1 is blocked but used=468 < buffer_size=2000
+  ok   Bug_NoEndOnResize
+    off -> after BeginWriteStall: BM2 NoLostWakeup: DB1 is blocked but used=0 < buffer_size=400
+  ok   Bug_NoRecheck
+    off -> MT5/MT6 flush jobs: BM2 NoLostWakeup: DB2 is blocked but used=117 < buffer_size=400
+  ok   Bug_WakeOne
+    off -> after free: BM4 CacheCovers: reserved=0 for used=30
+  ok   Bug_CacheRoundDown
+20 tests, 0 failed
+== build/test_random
     default                          150 runs x 400 steps: no violation
     avoid_flush_during_recovery      150 runs x 400 steps: no violation
     allow_ingest_behind              150 runs x 400 steps: no violation
     merge two memtables per flush    150 runs x 400 steps: no violation
     recycle and archive logs         150 runs x 400 steps: no violation
+    write buffer manager, stalls     150 runs x 400 steps: no violation
+    write buffer manager, cache, across DBs 150 runs x 400 steps: no violation
+    leveled compaction               150 runs x 400 steps: no violation
+    leveled, round robin, split keys 150 runs x 400 steps: no violation
+    leveled, ingest behind           150 runs x 400 steps: no violation
+    universal compaction             150 runs x 400 steps: no violation
+    universal, ingest behind         150 runs x 400 steps: no violation
   ok   RandomInterleavingsAllMechanismsOn
-    FixSyncAllLogs off           run 53, step 195: RecoveryDurable: acknowledged sync write 15 (k4) was lost
+    FixSyncAllLogs off           run 38, step 222: ST1 DurablePrefix: an ingested file with sequence number 15 survived, but the older write 13 was lost
     FixDirSync off               run 354, step 124: RecoveryDurable: acknowledged sync write 9 (k3) was lost
     FixWaitPendingInserts off    run 1, step 277: MT5/MT6 flush jobs: Coverage (I4): write 24 of CF 1 is in log 13 < N_c = 14 but not in an SST
     FixSyncClosedOnFlush off     run 104, step 81: RecoveryPrefix: write 3 survived but earlier write 1 was lost
@@ -104,8 +222,53 @@
     FixPublishAfterInserts off   run 1, step 29: WAL4b PublishGroup: MS1 ReadLatest: CF 0 key k0 reads nothing, expected 'v2'
     FixDeferDropDelete off       run 1, step 346: CF2 DropColumnFamily: MS1 ReadLatest: CF 1 key k1 reads nothing, expected 'v64'
     FixKeepUnpublishedShadowed off run 9, step 205: MT5/MT6 flush jobs: MS1 ReadLatest: CF 0 key k2 reads nothing, expected 'v20'
-    FixSyncRecoveredLogs off     run 21, step 109: RecoveryPrefix: write 6 survived but earlier write 2 was lost
+    FixSyncRecoveredLogs off     run 13, step 209: ST1 DurablePrefix: write 13 was at or below persistedThrough 21 but was lost
     FixResumeAtRecoveryLog off   run 31, step 185: RecoveryOpens: WAL9 refused to open: Corruption: an SST holds data beyond the point where replay stopped
-    found 16 of 18
+    FixScheduleFreeOnSeal off    run 1, step 187: WAL1 Admit: BM1 ExactAccounting: active=183 but mutable memtables hold 41
+    FixFreeAfterUnpin off        run 7, step 185: MT5/MT6 flush jobs: BM1 ExactAccounting: used=174 but memtables hold 321
+    FixEndStallOnFree off        run 1, step 204: MT5/MT6 flush jobs: BM2 NoLostWakeup: DB2 is blocked but used=41 < buffer_size=150
+    FixEndStallOnResize off      run 9, step 377: WAL1 Admit: BM2 NoLostWakeup: DB5 is blocked but used=198 < buffer_size=400
+    FixCacheRoundUp off          run 1, step 21: WAL4a InsertGroup (one CF): BM4 CacheCovers: reserved=0 for used=38
+    FixL0Overlap off             run 1, step 72: LSM11 compactions: MS1 ReadLatest: CF 1 key k4 reads 'v6', expected 'i17'
+    FixCleanCut off              run 206, step 342: DB6 CompactWrite (outputs on disk, not yet installed): MS1 ReadLatest: CF 0 key k1 reads 'v40', expected 'i56'
+    FixOutputOverlap off         run 1, step 139: DB6 CompactWrite (outputs on disk, not yet installed): MS1 ReadLatest: CF 0 key k4 reads 'v14', expected 'i26'
+    FixSkipBusy off              run 25, step 370: DB6 CompactWrite (outputs on disk, not yet installed): LS4 Exclusive: file 7 is an input of compactions 1 and 3
+    FixSnapshotKeep off          run 2, step 252: DB6 CompactWrite (outputs on disk, not yet installed): MS2 SnapshotRead: CF 0 key k1 at snapshot 21 reads nothing, expected 'v27'
+    FixTombstoneBottom off       run 14, step 201: Compaction: MS1 ReadLatest: CF 0 key k1 reads 'i6', expected nothing
+    FixAdjacentRuns off          run 2, step 119: DB6 CompactWrite (outputs on disk, not yet installed): MS1 ReadLatest: CF 1 key k4 reads 'v20', expected 'i34'
+    FixIngestBehindKeep off      run 5, step 374: SST2 IngestExternalFiles: MS1 ReadLatest: CF 0 key k1 reads 'i64', expected nothing
+    FixVersionRef off            run 2, step 252: DB6 CompactWrite (outputs on disk, not yet installed): LS5 PinnedLive: file 15 of a pinned version (CF 0) was deleted
+    FixIngestSkipCompacting off  not found
+    FixAtomicEdit off            run 1, step 72: DB7 InstallCompaction (first of two records): MS3 NewerShadowsOlder: CF 1 key k4 has seq 9 in read-path component 5 below an older seq 5
+    FixSyncBeforeApply off       run 1, step 72: LSM11 compactions: ST2 ManifestLive: the MANIFEST lists file 2, which is not on disk
+    FixProtectOutputs off        run 6, step 108: DB8 PurgeAllObsoleteFiles: ST3 OutputsLive: output 6 of compaction 1 was deleted before install
+    FixRecordLastSeq off         run 4, step 282: CF4 Open / WAL9 Recover: MS1 ReadLatest: CF 0 key k4 reads 'v39', expected 'i50'
+    FixSyncWalBeforeIngest off   run 233, step 103: ST1 DurablePrefix: an ingested file with sequence number 8 survived, but the older write 7 was lost
+    FixStallNeedsCompaction off  run 1, step 116: SST2 IngestExternalFiles: ST5 StallEnds: writes are stopped on L0 or compaction debt, and no compaction can run (auto compaction is off)
+    FixSanitizeTriggers off      run 1, step 105: CF4 Open / WAL9 Recover: ST5 StallEnds: writes are stopped on L0 or compaction debt, and no compaction is due
+    found 37 of 40
   ok   RandomInterleavingsFindEachBug
 2 tests, 0 failed
+== build/test_store
+  ok   PersistedThroughFollowsSyncAndFlush
+  ok   CompactionJobSurvivesACrashAtEveryStep
+  ok   FullPurgeKeepsTheOutputsOfARunningJob
+  ok   NoAutoCompactionMeansNoL0Stop
+  ok   TriggersAreSanitized
+  ok   IngestionSyncsTheWalFirst
+  ok   RecoveryWithoutBumpReusesAnOrphanNumberSafely
+    off -> DB7 InstallCompaction (first of two records): MS3 NewerShadowsOlder: CF 0 key a has seq 2 in read-path component 4 below an older seq 1
+  ok   Bug_SplitInstall
+    off -> LSM7-LSM9 compaction (finish): ST2 ManifestLive: the MANIFEST lists file 1, which is not on disk
+  ok   Bug_ApplyBeforeSync
+    off -> DB8 PurgeAllObsoleteFiles: ST3 OutputsLive: output 3 of compaction 1 was deleted before install
+  ok   Bug_PurgeOutputs
+    off -> CF4 Open / WAL9 Recover: ST4 FreshSeq: file 2 holds sequence number 2 but the next one to give out is 2
+  ok   Bug_NoLastSeq
+    off -> ST1 DurablePrefix: an ingested file with sequence number 3 survived, but the older write 2 was lost
+  ok   Bug_IngestNoWalSync
+    off -> MT5/MT6 flush jobs: ST5 StallEnds: writes are stopped on L0 or compaction debt, and no compaction can run (auto compaction is off)
+  ok   Bug_StallNoCompaction
+    off -> MT5/MT6 flush jobs: ST5 StallEnds: writes are stopped on L0 or compaction debt, and no compaction is due
+  ok   Bug_StopBelowTrigger
+14 tests, 0 failed

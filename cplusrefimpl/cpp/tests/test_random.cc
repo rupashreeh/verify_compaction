@@ -24,10 +24,14 @@ struct Sim {
   std::vector<uint64_t> jobs;
   std::vector<const Snapshot*> snaps;
   std::vector<CfId> held;  // dropped CFs whose handle is still open
+  std::vector<std::shared_ptr<MemtablePin>> pins;  // readers holding memtables (WBM2 waits for them)
+  std::vector<uint64_t> comps;                       // compactions started and not finished
+  std::vector<std::shared_ptr<VersionPin>> vpins;    // iterators holding versions (LSM10)
   int value = 0, ext = 0, cfName = 0;
   bool allowCrash;
+  bool compaction = false;  // also take compaction steps (LSM5 to LSM10)
 
-  Sim(uint64_t seed, bool crash) : rng(seed), allowCrash(crash) {}
+  Sim(uint64_t seed, bool crash, bool comp = false) : rng(seed), allowCrash(crash), compaction(comp) {}
 
   CfId RandomLive() {
     auto cs = f.db->tree.CFs();
@@ -40,6 +44,9 @@ struct Sim {
     for (CfId c : f.db->tree.CFs()) names.push_back(f.db->tree.Cf(c)->name);
     f.names = names;
     inflight.clear();
+    pins.clear();  // the readers die with the process
+    comps.clear();
+    vpins.clear();
     jobs.clear();
     snaps.clear();
     held.clear();
@@ -133,7 +140,48 @@ struct Sim {
 
   std::vector<std::string> trace;
   void T(std::string x) { trace.push_back(std::move(x)); }
+  // Write buffer manager steps: readers pin and release memtables, and the buffer
+  // size changes (WBM8).
+  void WbmStep() {
+    int r = rng.Uniform(3);
+    if (r == 0) { if (pins.size() < 2) pins.push_back(f.db->PinMemtables(RandomLive())); }
+    else if (r == 1) { if (!pins.empty()) pins.erase(pins.begin() + rng.Uniform(pins.size())); }
+    else f.db->Wbm().SetBufferSize(std::vector<size_t>{150, 250, 400}[rng.Uniform(3)]);
+    f.db->Step("WBM reader / SetBufferSize");
+  }
+
+  // Compaction steps: a compaction starts and finishes later, so others run in
+  // between (LSM5, LSM6, LSM9); iterators pin versions and read through them.
+  void CompactionStep() {
+    int r = rng.Uniform(8);
+    if (r == 0) { uint64_t id = f.db->CompactStart(RandomLive()); if (id) comps.push_back(id); }
+    else if (r == 1) {
+      // DB6 then DB7: write the outputs, and install them in a later step
+      if (!comps.empty()) {
+        size_t i = rng.Uniform(comps.size());
+        auto it = f.db->tree.compactions.find(comps[i]);
+        if (it == f.db->tree.compactions.end()) comps.erase(comps.begin() + i);
+        else if (!it->second.written) f.db->CompactWrite(comps[i]);
+        else { f.db->CompactInstall(comps[i]); comps.erase(comps.begin() + i); }
+      }
+    } else if (r == 2) f.db->CompactLevel(RandomLive(), rng.Uniform(3));
+    else if (r == 3) { if (vpins.size() < 2) vpins.push_back(f.db->PinVersion(RandomLive())); }
+    else if (r == 4) {
+      if (!vpins.empty()) {
+        size_t i = rng.Uniform(vpins.size());
+        std::string v;
+        f.db->ReadPinned(*vpins[i], Key(), &v);
+        f.db->ReleaseVersion(&vpins[i]);
+        vpins.erase(vpins.begin() + i);
+      }
+    } else if (r == 5) f.db->PurgeAllObsoleteFiles();  // DB8, full scan
+    else if (r == 6) f.db->SyncManifest();
+    else f.db->MaybeCompact();
+  }
+
   void Step() {
+    if (f.opts.write_buffer_manager && rng.OneIn(10)) { T("wbm"); WbmStep(); return; }
+    if (compaction && rng.OneIn(5)) { T("compaction"); CompactionStep(); return; }
     int r = rng.Uniform(100);
     T("r=" + std::to_string(r) + " published=" + std::to_string(f.db->tree.lastPublished) +
       " alloc=" + std::to_string(f.db->tree.lastAllocated) + " active=" + std::to_string(f.db->wal.ActiveNum()));
@@ -171,14 +219,30 @@ struct Config {
   const char* name;
   std::function<void(Options&)> set;
   bool crash = true;
+  bool compaction = false;
 };
+
+// Small sizes so that a run of a few hundred steps builds several levels.
+void Leveled(Options& o) {
+  o.disable_auto_compactions = false;
+  o.level0_file_num_compaction_trigger = 2;
+  o.max_bytes_for_level_base = 200;
+  o.target_file_size_base = 60;
+  o.num_levels = 4;
+}
+void Universal(Options& o) {
+  Leveled(o);
+  o.compaction_style = CompactionStyle::kUniversal;
+  o.level0_file_num_compaction_trigger = 3;
+}
 
 // Runs `seeds` random runs of `steps` steps. Returns the number of runs that found a
 // violation; the first violation is stored in *first.
 int Run(const Config& cfg, int seeds, int steps, std::string* first, int* firstStep, bool stopAtFirst) {
   int bad = 0;
   for (int seed = 1; seed <= seeds; seed++) {
-    Sim sim(seed * 7919 + 13, cfg.crash);
+    if (std::getenv("ONLYSEED") && seed != std::atoi(std::getenv("ONLYSEED"))) continue;
+    Sim sim(seed * 7919 + 13, cfg.crash, cfg.compaction);
     sim.f.opts.inline_background = false;
     sim.f.opts.write_buffer_size = 120;
     sim.f.opts.max_total_wal_size = 500;
@@ -217,6 +281,24 @@ TEST(RandomInterleavingsAllMechanismsOn) {
       {"allow_ingest_behind", [](Options& o) { o.allow_ingest_behind = true; }},
       {"merge two memtables per flush", [](Options& o) { o.max_write_buffer_number_to_merge = 2; o.max_write_buffer_number = 4; }},
       {"recycle and archive logs", [](Options& o) { o.recycle_log_file_num = 2; }},
+      {"write buffer manager, stalls", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(250, nullptr, true);
+       }},
+      {"write buffer manager, cache, across DBs", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(
+             250, std::make_shared<BlockCache>(100000, false), true,
+             WriteBufferFlushPolicy::kFlushLargestAcrossDBs, 64);
+       }},
+      {"leveled compaction", [](Options& o) { Leveled(o); }, true, true},
+      {"leveled, round robin, split keys", [](Options& o) {
+         Leveled(o);
+         o.compaction_pri = CompactionPri::kRoundRobin;
+         o.level_compaction_dynamic_level_bytes = false;
+         o.compaction_split_user_keys = true;
+       }, true, true},
+      {"leveled, ingest behind", [](Options& o) { Leveled(o); o.allow_ingest_behind = true; }, true, true},
+      {"universal compaction", [](Options& o) { Universal(o); }, true, true},
+      {"universal, ingest behind", [](Options& o) { Universal(o); o.allow_ingest_behind = true; }, true, true},
   };
   int seeds = std::getenv("SEEDS") ? std::atoi(std::getenv("SEEDS")) : 150;
   for (auto& cfg : cfgs) {
@@ -248,6 +330,48 @@ TEST(RandomInterleavingsFindEachBug) {
       {"FixKeepUnpublishedShadowed off", [](Options& o) { o.fix.FixKeepUnpublishedShadowed = false; }},
       {"FixSyncRecoveredLogs off", [](Options& o) { o.fix.FixSyncRecoveredLogs = false; o.avoid_flush_during_recovery = true; }},
       {"FixResumeAtRecoveryLog off", [](Options& o) { o.fix.FixResumeAtRecoveryLog = false; o.avoid_flush_during_recovery = true; }},
+      {"FixScheduleFreeOnSeal off", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(250, nullptr, true);
+         o.fix.FixScheduleFreeOnSeal = false; }},
+      {"FixFreeAfterUnpin off", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(250, nullptr, true);
+         o.fix.FixFreeAfterUnpin = false; }},
+      {"FixEndStallOnFree off", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(250, nullptr, true);
+         o.write_buffer_manager->fix.FixEndStallOnFree = false; }},
+      {"FixEndStallOnResize off", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(250, nullptr, true);
+         o.write_buffer_manager->fix.FixEndStallOnResize = false; }},
+      {"FixCacheRoundUp off", [](Options& o) {
+         o.write_buffer_manager = std::make_shared<WriteBufferManager>(
+             250, std::make_shared<BlockCache>(100000, false), true, WriteBufferFlushPolicy::kFlushOldest, 64);
+         o.write_buffer_manager->fix.FixCacheRoundUp = false; }},
+      // compaction (LSMTree.tla)
+      {"FixL0Overlap off", [](Options& o) { Leveled(o); o.fix.FixL0Overlap = false; }, true, true},
+      {"FixCleanCut off", [](Options& o) {
+         Leveled(o); o.compaction_split_user_keys = true; o.fix.FixCleanCut = false; }, true, true},
+      {"FixOutputOverlap off", [](Options& o) { Leveled(o); o.fix.FixOutputOverlap = false; }, true, true},
+      {"FixSkipBusy off", [](Options& o) { Leveled(o); o.fix.FixSkipBusy = false; }, true, true},
+      {"FixSnapshotKeep off", [](Options& o) { Leveled(o); o.fix.FixSnapshotKeep = false; }, true, true},
+      {"FixTombstoneBottom off", [](Options& o) { Leveled(o); o.fix.FixTombstoneBottom = false; }, true, true},
+      {"FixAdjacentRuns off", [](Options& o) { Universal(o); o.fix.FixAdjacentRuns = false; }, true, true},
+      {"FixIngestBehindKeep off", [](Options& o) {
+         Leveled(o); o.allow_ingest_behind = true; o.fix.FixIngestBehindKeep = false; }, true, true},
+      {"FixVersionRef off", [](Options& o) { Leveled(o); o.fix.FixVersionRef = false; }, true, true},
+      {"FixIngestSkipCompacting off", [](Options& o) { Leveled(o); o.fix.FixIngestSkipCompacting = false; }, true, true},
+      // ---- RocksDBStore.tla ----
+      {"FixAtomicEdit off", [](Options& o) { Leveled(o); o.fix.FixAtomicEdit = false; }, true, true},
+      {"FixSyncBeforeApply off", [](Options& o) { Leveled(o); o.fix.FixSyncBeforeApply = false; }, true, true},
+      {"FixProtectOutputs off", [](Options& o) { Leveled(o); o.fix.FixProtectOutputs = false; }, true, true},
+      {"FixRecordLastSeq off", [](Options& o) { Leveled(o); o.fix.FixRecordLastSeq = false; }, true, true},
+      {"FixSyncWalBeforeIngest off", [](Options& o) { Leveled(o); o.fix.FixSyncWalBeforeIngest = false; }, true, true},
+      {"FixStallNeedsCompaction off", [](Options& o) {
+         Leveled(o); o.disable_auto_compactions = true; o.level0_file_num_compaction_trigger = 1;
+         o.level0_slowdown_writes_trigger = 1; o.level0_stop_writes_trigger = 3;
+         o.fix.FixStallNeedsCompaction = false; }, true, true},
+      {"FixSanitizeTriggers off", [](Options& o) {
+         Leveled(o); o.level0_file_num_compaction_trigger = 4; o.level0_slowdown_writes_trigger = 2;
+         o.level0_stop_writes_trigger = 3; o.fix.FixSanitizeTriggers = false; }, true, true},
   };
   int seeds = std::getenv("SEEDS") ? std::atoi(std::getenv("SEEDS")) : 1000;
   int found = 0;
@@ -259,7 +383,7 @@ TEST(RandomInterleavingsFindEachBug) {
       Config one = cfg;
       int bad = 0;
       (void)bad;
-      Sim sim(s * 104729 + 7, true);
+      Sim sim(s * 104729 + 7, true, cfg.compaction);
       sim.f.opts.inline_background = false;
       sim.f.opts.write_buffer_size = 120;
       sim.f.opts.max_total_wal_size = 500;

@@ -28,6 +28,12 @@ void Note(KeyMax& m, CfId c, const std::string& k, SeqNo s) {
 // A write is "covered" if the store holds it or a newer version of its key
 // (a flush may drop a shadowed version, MT5).
 void Index(const LsmTree& T, KeyMax* sstMax, KeyMax* storeMax) {
+  if (T.ghost)
+    for (auto& [ck, s] : T.ghost->erased) {
+      if (!T.IsReadable(ck.first)) continue;
+      Note(*sstMax, ck.first, ck.second, s);
+      Note(*storeMax, ck.first, ck.second, s);
+    }
   for (auto& [c, cf] : T.cfs) {
     if (cf.state == CfState::kGone || cf.state == CfState::kNone) continue;
     for (auto& [ik, v] : cf.mem->table) Note(*storeMax, c, ik.key, ik.seq);
@@ -52,6 +58,13 @@ bool Covered(const KeyMax& m, const Ghost::Write& w) {
 }  // namespace
 
 // ============================================================ hooks
+void Ghost::OnCompactionDropped(CfId c, const std::vector<std::pair<std::string, SeqNo>>& dels) {
+  for (auto& [k, s] : dels) {
+    SeqNo& x = erased[{c, k}];
+    x = std::max(x, s);
+  }
+}
+
 void Ghost::OnAppend(const BatchState& b) {
   Batch& gb = batches[b.id];
   gb.cfs = b.Cfs();
@@ -75,7 +88,7 @@ void Ghost::OnPublish(const WriteGroup& G) {
     for (size_t i = 0; i < b->batch.ops.size(); i++) {
       auto& op = b->batch.ops[i];
       SeqNo s = b->firstSeq + i;
-      hist.push_back(Hist{op.cf, op.key, op.type == ValueType::kDelete, op.value, ++clock, s, false});
+      hist.push_back(Hist{op.cf, op.key, op.type == ValueType::kDelete, op.value, ++clock, s, false, 2 * s});
       auto it = writes.find(s);
       if (it != writes.end()) it->second.published = true;
     }
@@ -99,9 +112,12 @@ void Ghost::OnIngestCommit(uint64_t job, const std::vector<LsmTree::Placement>& 
                            const std::set<CfId>& done) {
   bool behind = !placed.empty() && placed.front().behind;
   uint64_t t = behind ? 0 : ++clock;  // ingest_behind files are older than everything
+  SeqNo last = writes.empty() ? 0 : writes.rbegin()->first;
+  for (auto& h : hist) last = std::max(last, h.seq);
   for (auto& p : placed)
     for (auto& e : p.f->entries)
-      hist.push_back(Hist{p.c, e.key, e.type == ValueType::kDelete, e.value, t, e.seq, true});
+      hist.push_back(Hist{p.c, e.key, e.type == ValueType::kDelete, e.value, t, e.seq, true,
+                          behind ? 0 : (e.seq > 0 ? 2 * e.seq : 2 * last + 1)});
   for (CfId c : done) jobs[job].done.insert(c);
 }
 
@@ -145,6 +161,25 @@ void Ghost::OnRecovered(const DB& db) {
       violations.push_back("RecoveryDurable: acknowledged sync write " + N(s) + " (" + w.key + ") was lost");
     }
   }
+  // ST1 DurablePrefix (rocksdb_store): every logged write up to persistedThrough
+  // survives, and no surviving ingestion is newer than a lost logged write.
+  SeqNo firstLost = 0;
+  for (auto& [s, w] : writes) {
+    if (!T.IsLive(w.cf) || !w.logged) continue;
+    if (Covered(storeMax, w)) continue;
+    if (firstLost == 0) firstLost = s;
+    if (s <= persistedThrough)
+      violations.push_back("ST1 DurablePrefix: write " + N(s) + " was at or below persistedThrough " +
+                           N(persistedThrough) + " but was lost");
+  }
+  if (firstLost != 0)
+    for (auto& x : hist)
+      if (x.ingest && x.seq > firstLost && T.IsLive(x.cf)) {
+        violations.push_back("ST1 DurablePrefix: an ingested file with sequence number " + N(x.seq) +
+                             " survived, but the older write " + N(firstLost) + " was lost");
+        break;
+      }
+  persistedThrough = 0;
   // the store now holds exactly what was recovered: issued' = present
   for (auto it = writes.begin(); it != writes.end();) {
     if (!T.IsLive(it->second.cf) || !Covered(storeMax, it->second)) it = writes.erase(it);
@@ -154,9 +189,9 @@ void Ghost::OnRecovered(const DB& db) {
   std::vector<Hist> h;
   for (auto& x : hist)
     if (x.ingest && T.IsLive(x.cf)) h.push_back(x);
-  for (auto& [s, w] : writes) h.push_back(Hist{w.cf, w.key, w.type == ValueType::kDelete, w.value, 0, s, false});
+  for (auto& [s, w] : writes) h.push_back(Hist{w.cf, w.key, w.type == ValueType::kDelete, w.value, 0, s, false, 2 * s});
   std::stable_sort(h.begin(), h.end(), [](const Hist& a, const Hist& b) {
-    if (a.seq != b.seq) return a.seq < b.seq;
+    if (a.ord != b.ord) return a.ord < b.ord;
     return a.t < b.t;
   });
   clock = 0;
@@ -310,15 +345,52 @@ std::vector<std::string> CheckInvariants(const DB& db, const Ghost& g) {
         if (it == minSoFar.end() || mx.first < it->second) minSoFar[k] = mx.first;
       }
     }
-    // MS6 LevelsDisjoint: files in L1 and deeper have disjoint key ranges
+    // LS1 LevelsDisjoint (MS6 extended to internal keys): files in L1 and deeper
+    // never share a version. Two neighbors may share a user key only if outputs
+    // may split one (compaction_split_user_keys); otherwise MS6's rule holds.
     for (int l = 1; l < static_cast<int>(cf.levels.size()); l++) {
       auto& fs = cf.levels[l];
+      IKeyCmp lt;
       for (size_t i = 0; i < fs.size(); i++)
-        for (size_t j = i + 1; j < fs.size(); j++)
-          if (fs[i]->Overlaps(fs[j]->lo, fs[j]->hi))
-            v.push_back(Str({"MS6 LevelsDisjoint: CF ", N(c), " level ", N(l), " files ", N(fs[i]->number),
-                             " and ", N(fs[j]->number), " overlap"}));
+        for (size_t j = i + 1; j < fs.size(); j++) {
+          auto& a = fs[i]->entries;
+          auto& b = fs[j]->entries;
+          if (a.empty() || b.empty()) continue;
+          bool disjoint = lt(IKey{a.back().key, a.back().seq}, IKey{b.front().key, b.front().seq}) ||
+                          lt(IKey{b.back().key, b.back().seq}, IKey{a.front().key, a.front().seq});
+          bool userDisjoint = !fs[i]->Overlaps(fs[j]->lo, fs[j]->hi);
+          if (!disjoint || (!userDisjoint && !db.opts.compaction_split_user_keys))
+            v.push_back(Str({"LS1 LevelsDisjoint (MS6): CF ", N(c), " level ", N(l), " files ",
+                             N(fs[i]->number), " and ", N(fs[j]->number), " overlap"}));
+        }
     }
+    // LS6 CurrentLive: every file of the current version is on disk, and every busy
+    // file is an input of a running compaction
+    std::set<uint64_t> busyIn;
+    for (auto& [id, C] : T.compactions)
+      for (auto& [l, f] : C.inputs) busyIn.insert(f->number);
+    auto live = [&](const std::shared_ptr<SstFile>& f) {
+      if (!db.env->Exists(f->path))
+        v.push_back(Str({"LS6 CurrentLive: CF ", N(c), " file ", N(f->number), " is in the version but not on disk"}));
+      if (f->beingCompacted && !busyIn.count(f->number))
+        v.push_back(Str({"LS6 CurrentLive: CF ", N(c), " file ", N(f->number), " is busy with no compaction"}));
+    };
+    // LS7 NoDuplicate: a version (key, seq > 0) is in at most one file
+    std::map<std::pair<std::string, SeqNo>, uint64_t> where;
+    auto dup = [&](const std::shared_ptr<SstFile>& f) {
+      for (auto& e : f->entries) {
+        if (e.seq == 0) continue;
+        auto [it, fresh] = where.insert({{e.key, e.seq}, f->number});
+        if (!fresh && it->second != f->number) {
+          v.push_back(Str({"LS7 NoDuplicate: CF ", N(c), " key ", e.key, " seq ", N(e.seq), " is in files ",
+                           N(it->second), " and ", N(f->number)}));
+          return;
+        }
+      }
+    };
+    if (cf.state == CfState::kLive)
+      for (int l = 0; l < static_cast<int>(cf.levels.size()); l++)
+        for (auto& f : (l == 0 ? cf.l0 : cf.levels[l])) { live(f); dup(f); }
     // MS7 LogNumberSafe: N_c never runs ahead of the log in which any of c's
     // unflushed memtables began
     if (cf.state == CfState::kLive) {
@@ -331,6 +403,28 @@ std::vector<std::string> CheckInvariants(const DB& db, const Ghost& g) {
                            " > memLog of an unflushed sealed memtable ", N(M->memLog)}));
     }
   }
+  // LS4 Exclusive: running compactions use disjoint files, and disjoint ranges of
+  // a shared output level (L0 outputs may overlap)
+  for (auto i = T.compactions.begin(); i != T.compactions.end(); ++i)
+    for (auto j = std::next(i); j != T.compactions.end(); ++j) {
+      const Compaction &A = i->second, &B = j->second;
+      if (A.c != B.c) continue;
+      for (auto& [la, fa] : A.inputs)
+        for (auto& [lb, fb] : B.inputs)
+          if (fa->number == fb->number)
+            v.push_back(Str({"LS4 Exclusive: file ", N(fa->number), " is an input of compactions ", N(A.id),
+                             " and ", N(B.id)}));
+      if (A.outLevel == B.outLevel && A.outLevel > 0 && !(A.hi < B.lo || B.hi < A.lo))
+        v.push_back(Str({"LS4 Exclusive: compactions ", N(A.id), " and ", N(B.id), " both write L",
+                         N(A.outLevel), " in [", A.lo, ", ", A.hi, "] and [", B.lo, ", ", B.hi, "]"}));
+    }
+  // LS5 PinnedLive: every file of a pinned version is still on disk
+  for (auto& w : T.pins)
+    if (auto p = w.lock())
+      for (auto& [l, f] : p->files)
+        if (!db.env->Exists(f->path))
+          v.push_back(Str({"LS5 PinnedLive: file ", N(f->number), " of a pinned version (CF ", N(p->c),
+                           ") was deleted"}));
   // MS4 BatchAtomic: a published batch is in every CF it writes
   for (auto& [id, b] : g.batches)
     if (b.first > 0 && b.last <= T.lastPublished && b.inserted != b.cfs)

@@ -37,6 +37,7 @@ void LsmTree::SealMutable(CfId c, LogNum n) {
   std::shared_ptr<MemTable> M = cf.mem;
   M->nextLog = n;  // its logged data lies in logs < n
   M->state = MemState::kSealed;
+  if (opts.fix.FixScheduleFreeOnSeal) M->MarkImmutable();  // B.ScheduleFreeMem (WBM2)
   cf.imm.push_back(M);  // oldest first
   cf.mem = NewMem(n);   // a new empty memtable with memLog = n
 }
@@ -64,33 +65,56 @@ LogNum LsmTree::LogNumber(CfId c) const {
 
 void LsmTree::ScheduleFlush(CfId c, FlushCause) { flushQueue.insert(c); }
 
+// LSM12 (DB10): compaction debt slows writes down, then stops them. With
+// FixStallNeedsCompaction, as in RocksDB's GetWriteStallConditionAndCause, the L0
+// and debt conditions apply only when auto compaction is on: otherwise nothing
+// would ever end the stop.
 StallState LsmTree::GetStallState() const {
+  StallState v = StallState::kGo;
+  const bool l0Stalls = !opts.disable_auto_compactions || !opts.fix.FixStallNeedsCompaction;
   for (auto& [id, cf] : cfs) {
     if (cf.state != CfState::kLive) continue;
     if (static_cast<int>(cf.imm.size()) >= opts.max_write_buffer_number - 1) return StallState::kStop;
-    if (static_cast<int>(cf.l0.size()) >= opts.level0_stop_writes_trigger) return StallState::kStop;
+    if (!l0Stalls) continue;
+    int n0 = opts.compaction_style == CompactionStyle::kUniversal ? static_cast<int>(SortedRuns(id).size())
+                                                                 : static_cast<int>(cf.l0.size());
+    uint64_t debt = PendingCompactionBytes(id);
+    if (n0 >= opts.level0_stop_writes_trigger) return StallState::kStop;
+    if (opts.hard_pending_compaction_bytes_limit && debt >= opts.hard_pending_compaction_bytes_limit)
+      return StallState::kStop;
+    if (n0 >= opts.level0_slowdown_writes_trigger ||
+        (opts.soft_pending_compaction_bytes_limit && debt >= opts.soft_pending_compaction_bytes_limit))
+      v = StallState::kDelay;
   }
-  return StallState::kGo;
+  return v;
 }
 
-size_t LsmTree::MutableMemoryUsage() const {
-  size_t sum = 0;
-  for (auto& [id, cf] : cfs)
-    if (cf.state == CfState::kLive) sum += cf.mem->bytes;
-  return sum;
-}
-
+// ---------------------------------------------------------------- WBM4 PickVictims
 std::set<CfId> LsmTree::PickWbmVictims() const {
-  // RocksDB's HandleWriteBufferManagerFlush picks the oldest mutable memtable
-  CfId best = 0;
-  SeqNo bestSeq = UINT64_MAX;
+  // cand <- live CFs with a non-empty mutable memtable and no flush pending or running.
+  // Every sealed memtable here has a flush scheduled, so "pending or running" is
+  // "imm is not empty".
+  const ColumnFamily* best = nullptr;
+  bool oldest = !wbm || wbm->Policy() == WriteBufferFlushPolicy::kFlushOldest;
+  for (auto& [id, cf] : cfs) {
+    if (cf.state != CfState::kLive || cf.mem->IsEmpty() || !cf.imm.empty()) continue;
+    if (!best) { best = &cf; continue; }
+    if (oldest ? cf.mem->id < best->mem->id           // created first
+               : cf.mem->bytes > best->mem->bytes)    // largest
+      best = &cf;
+  }
+  if (!best) return {};  // nothing in this DB can help
+  return {best->id};
+}
+
+size_t LsmTree::FlushableMemory(CfId* largest) const {
+  size_t m = 0;
   for (auto& [id, cf] : cfs)
-    if (cf.state == CfState::kLive && !cf.mem->IsEmpty() && cf.mem->firstSeq < bestSeq) {
-      best = id;
-      bestSeq = cf.mem->firstSeq;
+    if (cf.state == CfState::kLive && cf.imm.empty() && cf.mem->bytes > m) {
+      m = cf.mem->bytes;
+      if (largest) *largest = id;
     }
-  if (bestSeq == UINT64_MAX) return {};
-  return {best};
+  return m;
 }
 
 // ============================================================ MT5 FlushJob
@@ -155,7 +179,10 @@ uint64_t LsmTree::FlushStart(CfId c) {
   for (auto& M : job.P) {
     M->state = MemState::kBuilding;
     M->jobId = job.id;
+    if (M->pendingOut) ReleasePendingOutput(M->pendingOut);  // a retry captures again
+    M->pendingOut = 0;
   }
+  job.P.front()->pendingOut = CapturePendingOutput();  // DB8: protect the output until MT6
   jobs[job.id] = job;
   return nextJobId++;
 }
@@ -176,6 +203,8 @@ Status LsmTree::FlushFinish(uint64_t id) {
     }
     return s;
   }
+  if (blockCache && opts.table_options.prepopulate_block_cache == PrepopulateBlockCache::kFlushOnly)
+    Reader(f, true)->Prepopulate();  // BC11: warm the cache with the new file's data blocks
   for (auto& M : job.P) {
     M->state = MemState::kBuilt;
     M->output = f;
@@ -223,7 +252,14 @@ Status LsmTree::InstallFlush(CfId c) {
   s = LogAndApply(e);  // one atomic, durable MANIFEST edit, files synced first (K4)
   if (!s.ok()) return s;
   // Imm_c <- Imm_c without P; install a new super version
-  for (auto& M : P) cf->imm.erase(std::find(cf->imm.begin(), cf->imm.end(), M));
+  for (auto& M : P) {
+    cf->imm.erase(std::find(cf->imm.begin(), cf->imm.end(), M));
+    if (M->pendingOut) ReleasePendingOutput(M->pendingOut);
+    M->pendingOut = 0;
+  }
+  // Without FixFreeAfterUnpin, B.FreeMem runs here, even if a reader still holds M.
+  if (!opts.fix.FixFreeAfterUnpin)
+    for (auto& M : P) M->FreeNow();
   wal->AfterFlushInstall({c}, P);  // WAL7b: record the flush and retire logs (K3)
   // max_write_buffer_size_to_maintain is not modelled: P is freed when no reader holds it
   return Status::OK();
@@ -254,7 +290,8 @@ Status LsmTree::RunScheduledFlushes() {
 }
 
 // ============================================================ MT7 Get
-LookupResult LsmTree::Get(CfId c, const std::string& k, SeqNo s) const {
+template <class FileGet>
+LookupResult LsmTree::GetWith(CfId c, const std::string& k, SeqNo s, FileGet fileGet) const {
   const ColumnFamily* cf = Cf(c);
   LookupResult x;
   if (cf == nullptr) return x;
@@ -265,17 +302,56 @@ LookupResult LsmTree::Get(CfId c, const std::string& k, SeqNo s) const {
     x = (*it)->Get(k, s);
     if (x.kind != LookupResult::kNotFound) return x;
   }
+  bool failed = false;
   for (auto& F : cf->l0) {  // each L0 file, newest first
-    x = F->Get(k, s);
+    x = fileGet(F, true, &failed);
+    if (failed) return LookupResult{};
     if (x.kind != LookupResult::kNotFound) return x;
   }
   for (int l = 1; l <= Lmax(); l++)  // each level is sorted with disjoint files
     for (auto& F : cf->levels[l]) {
       if (k < F->lo || k > F->hi) continue;
-      x = F->Get(k, s);
+      x = fileGet(F, false, &failed);
+      if (failed) return LookupResult{};
       if (x.kind != LookupResult::kNotFound) return x;
     }
   return LookupResult{};
+}
+
+LookupResult LsmTree::Get(CfId c, const std::string& k, SeqNo s) const {
+  return GetWith(c, k, s, [&](const std::shared_ptr<SstFile>& F, bool, bool*) { return F->Get(k, s); });
+}
+
+LookupResult LsmTree::Read(CfId c, const std::string& k, SeqNo s, Status* st) const {
+  *st = Status::OK();
+  return GetWith(c, k, s, [&](const std::shared_ptr<SstFile>& F, bool inL0, bool* failed) {
+    if (!blockCache) return F->Get(k, s);  // no_block_cache: blocks are read and dropped
+    LookupResult r;
+    *st = Reader(F, inL0)->Get(k, s, BlockReadOptions{}, &r);  // BC9
+    if (!st->ok()) *failed = true;
+    return r;
+  });
+}
+
+// ============================================================ BC9 to BC11 table readers
+TableReader* LsmTree::Reader(const std::shared_ptr<SstFile>& f, bool inL0) const {
+  auto& r = readers_[f->number];
+  if (!r || r->file() != f) {
+    // BC10: the cache key prefix. With the fix it holds this open's session id, so
+    // the keys of a file are new even if its number was used before.
+    std::string prefix = opts.fix.FixUniqueKey ? sessionId + "/" + std::to_string(f->number)
+                                               : "file/" + std::to_string(f->number);
+    r.reset();
+    r = std::make_unique<TableReader>(f, prefix, opts, blockCache.get(), &tableStats, inL0);
+  }
+  return r.get();
+}
+
+void LsmTree::CloseReader(uint64_t number, bool obsolete) {
+  auto it = readers_.find(number);
+  if (it == readers_.end()) return;
+  if (obsolete && opts.uncache_aggressiveness > 0) it->second->Uncache();  // BC11
+  readers_.erase(it);  // releases the pinned index and filter blocks (K9)
 }
 
 // ============================================================ CF1 CreateColumnFamily
@@ -317,12 +393,21 @@ Status LsmTree::DropColumnFamily(CfId c) {
 void LsmTree::ClearData(ColumnFamily& cf) {
   cf.mem = NewMem(cf.mem->memLog);
   cf.imm.clear();
-  for (auto& f : cf.l0) env->Delete(f->path);
+  // The SSTs go the way of compaction inputs (LSM10): an iterator that still pins a
+  // version of this CF keeps its files until it lets go.
+  for (auto& f : cf.l0) {
+    CloseReader(f->number, true);
+    obsoleteFiles.push_back(f);
+  }
   cf.l0.clear();
   for (auto& lv : cf.levels) {
-    for (auto& f : lv) env->Delete(f->path);
+    for (auto& f : lv) {
+      CloseReader(f->number, true);
+      obsoleteFiles.push_back(f);
+    }
     lv.clear();
   }
+  PurgeObsoleteFiles();
 }
 
 // ============================================================ CF3 ReleaseHandle
@@ -358,7 +443,8 @@ std::vector<std::vector<std::pair<std::string, std::string>>> LsmTree::NewIterat
     }
     std::vector<std::pair<std::string, std::string>> rows;
     for (auto& k : keys) {
-      LookupResult x = Get(c, k, s);  // skips versions newer than s
+      Status st;
+      LookupResult x = Read(c, k, s, &st);  // skips versions newer than s
       if (x.kind == LookupResult::kFound) rows.push_back({k, x.value});
     }
     out.push_back(std::move(rows));
@@ -472,6 +558,15 @@ Status LsmTree::IngestExternalFiles(const std::vector<IngestArg>& args) {
       flushQueue.erase(c);
     }
   }
+  // DB9: sync the WAL, so that a crash cannot keep the file and lose an older write
+  if (opts.fix.FixSyncWalBeforeIngest && wal) {
+    for (auto& l : wal->L) {
+      Status s = wal->FlushWAL(*l);
+      if (!s.ok()) return cleanup(s);
+    }
+    Status s = wal->SyncWALs();
+    if (!s.ok()) return cleanup(s);
+  }
   // ---- (4) Place every file ----
   std::vector<Placement> placed;
   SeqNo snext = lastAllocated + 1;
@@ -504,6 +599,10 @@ Status LsmTree::AssignLevelAndSeqno(CfId c, const SstFile& F, SeqNo snext, const
   bool overlap = false;
   for (int i = 0; i <= Lmax(); i++) {
     if (opts.allow_ingest_behind && i == Lmax()) continue;  // reserved for ingest-behind
+    if (opts.fix.FixIngestSkipCompacting && RangeBeingCompacted(c, i, F.lo, F.hi)) {
+      overlap = true;  // a running compaction writes this range of L_i: stay above it,
+      break;           // with a new sequence number (RocksDB: RangeOverlapWithCompaction)
+    }
     if (DataOverlap(c, i, F)) {
       overlap = true;
       if (opts.fix.FixLevelAbove) break;  // F must stay above this level
@@ -550,7 +649,7 @@ Status LsmTree::CommitIngestion(std::vector<Placement>& placed, uint64_t jobId, 
     // one atomic edit across all CFs (K4)
     VersionEdit e;
     for (auto& p : placed) addTo(e, p);
-    e.lastSequence = std::max(manifestLastSeq, sstar);
+    if (opts.fix.FixRecordLastSeq) e.lastSequence = std::max(manifestLastSeq, sstar);
     e.nextFileNumber = nextFileNumber;
     Status s = LogAndApply(e);
     if (!s.ok()) return s;
@@ -583,54 +682,32 @@ Status LsmTree::CommitIngestion(std::vector<Placement>& placed, uint64_t jobId, 
   return Status::OK();
 }
 
-// ============================================================ compaction
-Status LsmTree::Compact(CfId c, int from) {
-  ColumnFamily* cf = Cf(c);
-  if (cf == nullptr || cf->state != CfState::kLive) return Status::InvalidArgument("CF is not live");
-  int to = from + 1;
-  if (from < 0 || to > Lmax()) return Status::InvalidArgument("bad level");
-  if (opts.allow_ingest_behind && to == Lmax()) return Status::InvalidArgument("bottommost level is reserved");
-  std::vector<std::shared_ptr<SstFile>> in;
-  if (from == 0) in = cf->l0;
-  else if (!cf->levels[from].empty()) in.push_back(cf->levels[from].front());
-  if (in.empty()) return Status::OK();
-  std::string lo = in.front()->lo, hi = in.front()->hi;
-  for (auto& f : in) { lo = std::min(lo, f->lo); hi = std::max(hi, f->hi); }
-  std::vector<std::shared_ptr<SstFile>> ov;
-  for (auto& g : cf->levels[to])
-    if (g->Overlaps(lo, hi)) ov.push_back(g);
-  // merge; every version is kept, so the model checks the order of versions
-  std::map<IKey, std::pair<ValueType, std::string>, IKeyCmp> merged;
-  for (auto* group : {&in, &ov})
-    for (auto& f : *group)
-      for (auto& e : f->entries) merged[IKey{e.key, e.seq}] = {e.type, e.value};
-  auto out = std::make_shared<SstFile>();
-  out->number = nextFileNumber++;
-  out->path = NumberedName("sst", out->number, "sst");
-  for (auto& [ik, tv] : merged) out->entries.push_back(Entry{ik.key, ik.seq, tv.first, tv.second});
-  out->ComputeBounds();
-  for (auto* group : {&in, &ov})
-    for (auto& f : *group) out->largestLoggedSeq = std::max(out->largestLoggedSeq, f->largestLoggedSeq);
-  Status s = env->WriteFileDurably(out->path, EncodeSst(out->entries, 0));
+// ============================================================ MANIFEST
+Status LsmTree::LogAndApply(VersionEdit& e) {
+  Status s = SyncManifest();  // records go to the MANIFEST in order
   if (!s.ok()) return s;
-  VersionEdit e;
-  for (auto& f : in) e.delFile.push_back({c, from, f->number});
-  for (auto& f : ov) e.delFile.push_back({c, to, f->number});
-  e.addFile.push_back(FileAdd{c, to, out->number, 0, nextEpoch++, out->largestLoggedSeq, out});
-  e.nextFileNumber = nextFileNumber;
-  s = LogAndApply(e);
+  s = ManifestAppend(env, e);
   if (!s.ok()) return s;
-  for (auto* group : {&in, &ov})
-    for (auto& f : *group) env->Delete(f->path);
+  NoteDurable(e);
+  Apply(e);
   return Status::OK();
 }
 
-// ============================================================ MANIFEST
-Status LsmTree::LogAndApply(VersionEdit& e) {
-  Status s = ManifestAppend(env, e);
-  if (!s.ok()) return s;
-  Apply(e);
+Status LsmTree::SyncManifest() {
+  while (!pendingEdits.empty()) {
+    Status s = ManifestAppend(env, pendingEdits.front());
+    if (!s.ok()) return s;
+    NoteDurable(pendingEdits.front());
+    pendingEdits.erase(pendingEdits.begin());
+  }
   return Status::OK();
+}
+
+void LsmTree::NoteDurable(const VersionEdit& e) {
+  for (auto& [c, name] : e.addCf) durableFiles[c];
+  for (CfId c : e.dropCf) durableFiles.erase(c);
+  for (auto& [c, level, num] : e.delFile) durableFiles[c].erase(num);
+  for (auto& fa : e.addFile) durableFiles[fa.cf].insert(fa.number);
 }
 
 void LsmTree::Apply(const VersionEdit& e) {
@@ -650,7 +727,10 @@ void LsmTree::Apply(const VersionEdit& e) {
   }
   for (auto& [c, n] : e.logNumber)
     if (auto* cf = Cf(c)) cf->N = n;
+  std::set<uint64_t> moved;  // a trivial move deletes and adds the same file (LSM9)
+  for (auto& fa : e.addFile) moved.insert(fa.number);
   for (auto& [c, level, num] : e.delFile) {
+    CloseReader(num, !moved.count(num));  // the file is obsolete (BC11), unless it only moved
     auto* cf = Cf(c);
     if (!cf) continue;
     auto& v = level == 0 ? cf->l0 : cf->levels[level];
@@ -674,7 +754,12 @@ void LsmTree::Apply(const VersionEdit& e) {
     } else {
       cf->levels[fa.level].push_back(f);
       std::sort(cf->levels[fa.level].begin(), cf->levels[fa.level].end(),
-                [](auto& x, auto& y) { return x->lo < y->lo; });
+                [](auto& x, auto& y) {  // by key; two files may share a boundary user key
+                  if (x->lo != y->lo) return x->lo < y->lo;
+                  SeqNo sx = x->entries.empty() ? 0 : x->entries.front().seq;
+                  SeqNo sy = y->entries.empty() ? 0 : y->entries.front().seq;
+                  return sx > sy;
+                });
     }
   }
   if (e.lastSequence) manifestLastSeq = std::max(manifestLastSeq, *e.lastSequence);
@@ -706,7 +791,17 @@ Status LsmTree::OpenManifest(bool readOnly) {
   for (auto& e : edits) Apply(e);
   recovering_ = false;
   for (auto& [id, cf] : cfs) cf.mem = NewMem(cf.N);
-  // never reuse the number of a file left behind by a crash
+  durableFiles.clear();
+  for (auto& [id, cf] : cfs) {
+    auto& d = durableFiles[id];
+    for (auto& f : cf.l0) d.insert(f->number);
+    for (auto& lv : cf.levels)
+      for (auto& f : lv) d.insert(f->number);
+  }
+  pendingEdits.clear();
+  pendingOutputs.clear();
+  // DB1: never reuse the number of a file left behind by a crash
+  if (opts.fix.FixBumpFileNumber)
   for (auto& p : env->List("sst")) {
     unsigned long long n = 0;
     if (std::sscanf(p.c_str(), "sst/%llu.sst", &n) == 1) nextFileNumber = std::max<uint64_t>(nextFileNumber, n + 1);

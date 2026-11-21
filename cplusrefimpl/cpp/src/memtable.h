@@ -44,6 +44,13 @@ struct SstFile {
   uint64_t epoch = 0;          // install order; L0 is kept newest first by epoch
   SeqNo largestLoggedSeq = 0;  // largest seq that came through the WAL (0 for ingested files)
   std::vector<Entry> entries;  // with effective sequence numbers
+  bool beingCompacted = false; // an input of a running compaction (LSM5, LSM6)
+
+  uint64_t Size() const {      // bytes, for level targets and file cuts (LSM4, LSM8)
+    uint64_t n = 0;
+    for (auto& e : entries) n += e.key.size() + e.value.size() + 16;
+    return n;
+  }
 
   LookupResult Get(const std::string& k, SeqNo s) const;
   bool Overlaps(const std::string& a, const std::string& b) const { return !(hi < a || b < lo); }
@@ -80,10 +87,18 @@ class SstFileWriter {
 // MemTable. Its life cycle is Mutable -> Sealed -> Building -> Built -> installed.
 enum class MemState { kMutable, kSealed, kBuilding, kBuilt };
 
+class WriteBufferManager;
+
 class MemTable {
  public:
-  MemTable(uint64_t id, LogNum memLog, size_t writeBufferSize)
-      : id(id), memLog(memLog), writeBufferSize_(writeBufferSize) {}
+  // wbm may be null (nothing is charged). Otherwise the memtable charges it through
+  // its AllocTracker fields below: ReserveMem on insert (WBM1), ScheduleFreeMem at
+  // seal (MarkImmutable, WBM2), and FreeMem when it is destroyed (WBM2).
+  MemTable(uint64_t id, LogNum memLog, size_t writeBufferSize,
+           std::shared_ptr<WriteBufferManager> wbm = nullptr);
+  ~MemTable();
+  MemTable(const MemTable&) = delete;
+  MemTable& operator=(const MemTable&) = delete;
 
   void Insert(const Entry& r, bool logged = true);              // MT1
   LookupResult Get(const std::string& k, SeqNo s) const;        // MT2
@@ -100,10 +115,19 @@ class MemTable {
   SeqNo largestLoggedSeq = 0;       // ignores disableWAL writes
   uint64_t jobId = 0;               // the flush job building it (MT5)
   std::shared_ptr<SstFile> output;  // set when Built
+  uint64_t pendingOut = 0;          // DB8: the pending-output number its flush job captured (0: none)
   std::map<IKey, std::pair<ValueType, std::string>, IKeyCmp> table;
+
+  // ---- AllocTracker (write buffer manager accounting) ----
+  void MarkImmutable();             // MT4 calls it: B.ScheduleFreeMem (WBM2)
+  void FreeNow();                   // B.FreeMem now (only for the FixFreeAfterUnpin bug)
+  size_t allocated = 0;             // bytes charged to B
+  bool doneAllocating = false;      // ScheduleFreeMem has run
+  bool freed = false;               // FreeMem has run
 
  private:
   size_t writeBufferSize_;
+  std::shared_ptr<WriteBufferManager> wbm_;
 };
 
 }  // namespace lsm

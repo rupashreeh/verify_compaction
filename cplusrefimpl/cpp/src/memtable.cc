@@ -2,7 +2,30 @@
 
 #include <algorithm>
 
+#include "write_buffer_manager.h"
+
 namespace lsm {
+
+MemTable::MemTable(uint64_t id, LogNum memLog, size_t writeBufferSize,
+                   std::shared_ptr<WriteBufferManager> wbm)
+    : id(id), memLog(memLog), writeBufferSize_(writeBufferSize), wbm_(std::move(wbm)) {
+  if (wbm_) wbm_->Track(this);
+}
+
+// ~AllocTracker: the memtable is gone, so B.FreeMem (WBM2).
+MemTable::~MemTable() {
+  if (!wbm_) return;
+  if (!freed) wbm_->FreeMem(this);
+  wbm_->Untrack(this);
+}
+
+void MemTable::MarkImmutable() {
+  if (wbm_) wbm_->ScheduleFreeMem(this);
+}
+
+void MemTable::FreeNow() {
+  if (wbm_) wbm_->FreeMem(this);
+}
 
 // ---------------------------------------------------------------- MT1 Insert
 void MemTable::Insert(const Entry& r, bool logged) {
@@ -10,7 +33,11 @@ void MemTable::Insert(const Entry& r, bool logged) {
   // writer inserts serially, which is the "else" branch of MT1.
   auto [it, fresh] = table.insert_or_assign(IKey{r.key, r.seq}, std::make_pair(r.type, r.value));
   (void)it;
-  if (fresh) bytes += r.key.size() + r.value.size() + 16;  // |e|
+  if (fresh) {
+    size_t e = r.key.size() + r.value.size() + 16;  // |e|
+    bytes += e;
+    if (wbm_) wbm_->ReserveMem(this, e);  // B.Charge (WBM1)
+  }
   firstSeq = std::min(firstSeq, r.seq);
   largestSeq = std::max(largestSeq, r.seq);
   if (logged) largestLoggedSeq = std::max(largestLoggedSeq, r.seq);
