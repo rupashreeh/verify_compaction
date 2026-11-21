@@ -128,6 +128,62 @@ adds three of its own:
 - **(K13)** Every reader holds a reference to the version it reads until it is done. This includes
   Get, iterators, flushes, and compactions.
 
+## The Data Structure
+
+These are the fields of the LSM tree, for one column family. The other parts of the store (the
+log, the write buffer manager, the block cache) keep their own fields and are not listed here.
+
+```
+Data structure LSMTree
+    mem          : Memtable                 the memtable that takes new writes
+    imm          : list of Memtable         full memtables waiting to be flushed, oldest first
+
+    version      : Version                  the current list of files, per level
+    oldVersions  : Version → ℕ              older lists that readers still use, with how many readers each
+    jobs         : set of CompactionJob     the compactions running now
+    busy         : set of FileId            the files those compactions are reading
+    cursor       : Level → Key              where each level's last compaction stopped (kRoundRobin only)
+
+    snapshots    : set of SeqNo             the open snapshots
+    lastSeq      : SeqNo                    the sequence number of the last write
+    nextFileId   : ℕ                        the number the next new file gets
+    nextEpoch    : ℕ                        the epoch the next L0 file gets
+
+Data structure Version
+    L0           : list of SstFile          newest first; files may hold the same keys
+    L1 ... Lmax  : list of SstFile          one list per level, in key order; files never overlap
+
+Data structure SstFile                      written once, never changed
+    id           : FileId                   its number; also its file name
+    epoch        : ℕ                        L0 only: higher means newer
+    smallest     : Key                      its first key
+    largest      : Key                      its last key
+    entries      : list of Entry            sorted by key, and newest first within a key
+    size         : bytes
+
+Data structure Entry                        one version of one key
+    key          : Key
+    seq          : SeqNo                    the write's sequence number; higher means newer
+    type         : Put or Delete
+    value        : bytes                    empty for a Delete
+
+Data structure CompactionJob
+    inputs       : set of SstFile           the files it merges, from one or more levels
+    outputLevel  : Level                    where its new files go
+    snapshots    : set of SeqNo             the open snapshots when it started
+    outputs      : list of SstFile          the files it has written so far
+```
+
+Some values are not stored, because they follow from the fields above. A level's size is the sum
+of its files' sizes. Its target size, its score, and the base level come from those sizes and the
+options. The sorted runs come from the version: each L0 file is one run, and each deeper level is
+one run.
+
+A flush adds a file to the front of `L0` with the next epoch. A compaction takes its `inputs` out of
+the version and puts its `outputs` in, in one step. A file leaves the disk only when neither
+`version` nor any of `oldVersions` lists it. In the TLA+ model, `version` is `V`, `jobs` is `comps`,
+`snapshots` is `snaps`, and a reader's old version is `pinned`.
+
   ## State
 
 The state contains the list of the tree's files and the level each one sits in. It also contains
