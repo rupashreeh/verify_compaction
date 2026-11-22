@@ -17,7 +17,7 @@
 
 A key–value store built as an LSM tree keeps new writes in memory, in a sorted buffer called a memtable. Every write gets a sequence number. A delete is a write which leaves a deletion marker (a tombstone). When a memtable is full, a flush writes it to disk as an SST file, a sorted file that never changes. New SST files go to level 0 (L0). 
 
-A read must look for a key at different places namely the memtable, every L0 file, and each deeper level. This can cause reads to become slow and older tombstones keys are still on disk which causes space to grow. Compaction is aimed at fixing these issues. It is responsible for reading files , merging them when appropriate and droppig versions that are no longer relevant. 
+A read must look for a key at different places namely the memtable, every L0 file, and each deeper level. This can cause reads to become slow, and old versions and tombstones stay on disk, which causes space to grow. Compaction is aimed at fixing these issues. It is responsible for reading files, merging them when appropriate, and dropping versions that are no longer relevant.
 
 Compaction sets three costs that trade against each other:
 
@@ -25,7 +25,7 @@ read amplification: how many places a read checks;
 write amplification: how many times each byte is rewritten on its way down;
 space amplification: how much dead data sits on disk.
 
-In this project we only consider Leveled and Universal. compacton strategies. 
+In this project we only consider the Leveled and Universal compaction strategies.
 
 ### From the paper to RocksDB
 
@@ -147,6 +147,7 @@ Data structure LSMTree
     snapshots    : set of SeqNo             the open snapshots
     lastSeq      : SeqNo                    the sequence number of the last write
     nextFileId   : ℕ                        the number the next new file gets
+    pending      : set of FileId            the first file number of each job still writing files
     nextEpoch    : ℕ                        the epoch the next L0 file gets
 
 Data structure Version
@@ -181,10 +182,10 @@ one run.
 
 A flush adds a file to the front of `L0` with the next epoch. A compaction takes its `inputs` out of
 the version and puts its `outputs` in, in one step. A file leaves the disk only when neither
-`version` nor any of `oldVersions` lists it. In the TLA+ model, `version` is `V`, `jobs` is `comps`,
-`snapshots` is `snaps`, and a reader's old version is `pinned`.
+`version` nor any of `oldVersions` lists it. A file whose number is at or above the smallest
+number in `pending` may still be being written, so it is never deleted either.
 
-  ## State
+## State
 
 The state contains the list of the tree's files and the level each one sits in. It also contains
 the older file lists that readers still use, a busy mark on each file that a compaction is using,
@@ -414,17 +415,17 @@ files is LSM10, scheduling is LSM11, and slowing writes is LSM12. The file size 
 | Algorithm | Procedure | What it does |
 |---|---|---|
 | LSM1 | `RollingMerge(i)` | The paper's rolling merge between C_i and C_i+1, with its cursor |
-| LSM2 | `SortedRuns(V)`, `Get` in a level | The shape of the tree, and how a read walks it |
+| LSM2 | `SortedRuns(v)`, `GetInLevel(n, k, s)` | The shape of the tree, and how a read walks it |
 | LSM3 | `Overlapping(n, a, b)`, `ExpandToCleanCut(n, I)` | Files that overlap a range; grow a pick to whole user keys |
-| LSM4 | `LevelTargets(V)`, `Scores(V)` | Base level, target sizes, and scores (static and dynamic level bytes) |
-| LSM5 | `PickLeveled(V)` | Level, file, clean cut, output overlap, busy check, trivial move |
-| LSM6 | `PickUniversal(V)` | Periodic, size amplification, size ratio, run count; output level |
-| LSM7 | `CompactionIterator(I, o, S)` | Which versions survive: snapshot stripes, deletions at the bottom |
-| LSM8 | `WriteOutputs(o)` | Cut the merged stream into files, never inside a user key |
-| LSM9 | `InstallCompaction(c, I, out, o)` | One atomic version edit |
-| LSM10 | `Ref`, `Unref`, `PurgeObsoleteFiles` | A file is deleted only when no live version lists it |
+| LSM4 | `LevelTargets(v)` | Base level, target sizes, and scores (static and dynamic level bytes) |
+| LSM5 | `PickLeveled(v, due)` | Level, file, clean cut, output overlap, busy check, trivial move |
+| LSM6 | `PickUniversal(v)` | Periodic, size amplification, size ratio, run count; output level |
+| LSM7 | `CompactionIterator(p, S; C)`, `KeyNotExistsBeyond(k, p)` | Which versions survive: snapshot stripes, deletions at the bottom; inputs are read through the block cache without filling it (BC9) |
+| LSM8 | `WriteOutputs(E, o)` | Cut the merged stream into files, never inside a user key |
+| LSM9 | `InstallCompaction(p, out, m)` | One MANIFEST record swaps the inputs for the outputs (K4) |
+| LSM10 | `Ref`, `Unref`, `PurgeObsoleteFiles` | A file is deleted only when no live version lists it and no job may still be writing it (DB8, BC11) |
 | LSM11 | `MaybeSchedule`, `BackgroundCompaction` | The compaction loop |
-| LSM12 | `StallCondition(c)` | L0 count and compaction debt slow and stop writes |
+| LSM12 | `T.StallState()` | Go, Delay or Stop for the write path (WAL1, DB10), from the memtables waiting to flush, the L0 files or sorted runs, and the compaction debt |
 
 ## Invariants
 
@@ -436,11 +437,37 @@ LS3, reads never change: A read, or a read from a snapshot, returns the last val
 LS4, no shared work:  Two running compactions never use the same file or write the same keys into the same level.
 LS5, readers keep their files: No file is deleted while a reader still uses it.
 
-Two more rules are checked too, but they aremostly for bookkeeping:
+Two more rules are checked too, but they are mostly for bookkeeping:
 
 LS6, current files exist: Every file in the store's current list is on disk.
 LS7, one copy: Each version of a key is in exactly one file.
 
 The sections above show how compaction keeps each rule. It takes every overlapping file of the level below (LS1), and it moves whole keys and merges only runs next to each other in age (LS2). It keeps what readers and snapshots can still see, and drops a delete only at the bottom (LS3). It skips busy files (LS4), and it deletes old files only after their readers are done (LS5).
 
-## Findings
+## Document underspecification in the Wiki:
+
+(a) The wiki says that L0 files overlap, so an L0 compaction "normally" picks up all of them, but never says which smaller set is safe. LSM3 and LSM5 take the file picked and every L0 file that overlaps it, older ones too, and keep growing the set until no other L0 file overlaps it. Without this, the newer version of a key moves down to L1 while an older L0 file still holds an older version above it, and a read returns the old value.
+
+(b) The wiki says a pick grows to include neighboring files that share a user key (a "clean cut"), but never says why. LSM3 grows the pick until it holds every version of every key in its range. This is needed only because an output file may end between two versions of one key; LSM8 never cuts there, and then the growth never adds a file. Without it, the file with the newer version can move down below the file with the older one, and a read returns the old value. *(unchecked)*
+
+(c) The wiki says a pick takes the files it overlaps in the next level, but never says that this is also what makes deleting safe. LSM5 takes every overlapping file of the output level. If one is left out, the merge cannot see the older value it holds, believes nothing is below, and drops a delete, so the deleted value comes back.
+
+(d) The wiki says compaction drops versions that are no longer needed, but never says which ones are. LSM7 keeps, for each key, the newest version that each open snapshot can see, and drops the rest. Without this rule, a snapshot read finds a version that a compaction removed and returns a different value than it did before.
+
+(e) The wiki says deletes are removed when they reach the bottom, but never says what "the bottom" means for one compaction. LSM7 drops a delete only when no file outside the job, at the output level or below it (or in an older L0 file), holds its key, and no snapshot can still see an older value. Without this, a delete that meets no older value in its own inputs is dropped while an older value still sits deeper, and that value comes back.
+
+(f) The universal compaction page explains how runs are chosen by size, but never says that only runs next to each other in age may be merged, or where the result goes. LSM6 merges only neighbors in age, and puts the result where they were: in the level of the oldest run merged, or just above the next older run, or in the last level if there is none. Without this, the result holds data both newer and older than a run it skipped, and a read can find an old version before a newer one. *(unchecked)*
+
+(g) The wiki says universal compaction can write its result into L0, but never says that the result must then be a single file. LSM8 never cuts an output to L0, because each L0 file counts as one sorted run. If it is cut into two files of the same age, a later compaction can take one of them with an older run, put the result below the other, and bring a deleted value back. *(unchecked)*
+
+(h) The wiki says `allow_ingest_behind` reserves the last level for files ingested behind all data, but never says what this asks of compaction. LSM7 never drops a delete while the option is on, LSM5 never writes to the last level, and LSM6 leaves the last level's run out of every pick. Without these rules, a delete is dropped and a later ingest-behind file brings the old value back, or a compaction puts newer data into the reserved level beside the next ingested file. (Item (l) of the memtable document is the same gap seen from ingestion.) *(unchecked)*
+
+(i) The wiki says that several compactions can run at once, but never says how they stay apart. LSM5 and LSM6 skip any file another compaction is using, and LSM5 also skips a key range that a running compaction will write in the output level. Without this, two jobs install overlapping files into one level, or one job deletes a file the other is still merging.
+
+(j) The wiki says ingestion places a file in the lowest level it fits, but never says what happens while a compaction is running. SST3 stops above any level where a running compaction will install output that overlaps the file's range. Without this, the compaction installs its output next to the ingested file, and the level holds two files with the same keys.
+
+(k) The wiki says an obsolete SST file is deleted, but never says how the store avoids deleting a file that a compaction is still writing, which no version lists yet. LSM10 (DB8) deletes a file only if no live version lists it and its number is below the smallest number of every job still writing. Without this, a purge that runs during a long compaction can delete its half-written output.
+
+(l) The wiki says compaction reads use the block cache, but never says whether they add what they read to it. LSM7 reads its inputs through BC9 with `fill_cache = false` (K10), so one large compaction does not push out the blocks that user reads need. *(unchecked)*
+
+The items marked *(unchecked)* rest on what we know of the RocksDB code and should be checked against its source.

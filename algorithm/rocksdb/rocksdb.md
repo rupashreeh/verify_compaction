@@ -8,7 +8,7 @@
   [Creating and Ingesting SST files](https://github.com/facebook/rocksdb/wiki/Creating-and-Ingesting-SST-files),
   [Compaction](https://github.com/facebook/rocksdb/wiki/Compaction)
 
-  ## The Store at a Glance
+## The Store at a Glance
 
 RocksDB is a key–value store. An application puts and deletes keys, reads them back, and can hand
 the store a whole sorted file built elsewhere. The picture shows every part of the store and how
@@ -152,8 +152,9 @@ the write controller's answer.
 A **job** records its input files, its output level, the snapshots it saw when it started, the
 file number it noted when it started (`minOut`), and the files it has written (`outs`). RocksDB may
 run several jobs at once. The store here holds one; the LSM tree specification shows how several
-stay apart. **Pending outputs** are the file numbers noted by running jobs. A flush or compaction
-job adds `nextFileId` when it starts and removes it when its record is applied.
+stay apart. **Pending outputs** (`T.pending` in the LSM tree) are the file numbers noted by running
+jobs. A flush, a compaction, or an ingestion adds `nextFileId` when it starts and removes it when
+its record is applied.
 
 ## How It Fits the Other Specifications
 
@@ -185,20 +186,24 @@ specifications. The whole store adds five more, one for each problem listed abov
 
 ## Algorithms
 
+All the algorithms are in one file, `DB_algorithms_all.tex` and `.pdf`, in the same box style as
+the other parts. The first box follows one write from `Open` to `Close`. Each store algorithm calls
+the algorithms of the other parts by name, so this table also says which part does the work.
+
 | Algorithm | Procedure | What it does |
 |---|---|---|
 | DB0 | `RocksDBStore` | The data structure above |
-| DB1 | `Open(θ)` | Sanitize the options, read the MANIFEST, set the counters past everything on disk, replay the WAL, delete orphans, new cache session |
-| DB2 | `Write(b, sync)` | Wait for `accepting`, number, log, sync if asked (moves `persistedThrough`), insert, publish |
-| DB3 | `Get(c, k, snap)` | Read the memtables, then the files, through the block cache |
-| DB4 | `Flush(c)` | Memtables to one L0 file, protected as a pending output, one record |
-| DB5 | `PickCompaction()` | Pick inputs by the policy, capture `minOut` |
-| DB6 | `RunCompactionJob(j)` | Merge and write the outputs, synced, in no version yet |
-| DB7 | `InstallCompaction(j)` | One record, synced, then the new version |
-| DB8 | `PurgeObsoleteFiles(full)` | Delete files no live version lists, but keep pending outputs |
-| DB9 | `IngestExternalFile(c, F)` | Stop writes, flush an overlapping memtable, sync the WAL, place the file, one record |
-| DB10 | `UpdateWriteStall()` | Set `accepting`; stop only where a background job can end the stop |
-| DB11 | `Close()` | Stop the job, flush log buffers, release the shared parts |
+| DB1 | `Open(θ)` | Sanitize the options, read the MANIFEST, set the counters past everything on disk, open the column families and replay the logs (CF4, WAL9), start a new cache session (BC10), delete orphans (DB8), start compactions (LSM11a) |
+| DB2 | `Write(b, sync)` | Admit the group (WAL1), number and log it (WAL2, WAL3a), sync if asked (WAL3b, moves `persistedThrough`), insert and publish it (WAL4a, WAL4b) |
+| DB3 | `Get(c, k, s)` | Hold the version (LSM10a), read newest first through the block cache (MT7, BC9), let go (LSM10b) |
+| DB4 | `Flush(c)` | Protect the new file number, write the L0 file (MT5), warm the cache (BC11), install it in one record (MT6) |
+| DB5 | `PickCompaction()` | Pick inputs by the policy (LSM4, LSM5, LSM6), hold the version (LSM10a), protect `minOut` |
+| DB6 | `RunCompactionJob(j)` | Merge without filling the cache (LSM7a) and write synced outputs (LSM8), in no version yet |
+| DB7 | `InstallCompaction(j)` | One synced record, then the new version (LSM9); let go of the version (LSM10b) |
+| DB8 | `PurgeObsoleteFiles(full)` | Delete files no live version lists and no running job may write (LSM10c, BC11); dispose of old logs (WAL8b) |
+| DB9 | `IngestExternalFile(c, F)` | Stop writes, flush an overlapping memtable, sync the logs (WAL3b), place the file (SST3), one record (SST4) |
+| DB10 | `UpdateWriteStall()` | `accepting` is true unless the tree (LSM12) or the write buffer manager (WBM5) says stop |
+| DB11 | `Close()` | Stop the jobs, flush the log buffer (WAL3a), leave the write buffer manager (WBM8), free the memtables (WBM2) |
 
 ## Invariants
 
@@ -226,3 +231,25 @@ out. **ST7:** `accepting` is true exactly when writes are not stopped. **ST8:** 
 within the write buffer manager's limit. The parts' own invariants hold as before: the WAL's I1 to
 I5, MS1 to MS7, BM1 to BM6, CH1 to CH8, and LS1 to LS7. The TLA+ model checks LS1, LS2, LS3, and
 LS6 together with ST1 to ST8.
+
+## Document underspecification in the Wiki:
+
+(a) The Write Stalls page says writes stop when L0 has too many files or compaction has too much work left, but never says that this happens only when automatic compaction is on. LSM12, which DB10 reads, checks `disable_auto_compactions` before both rules. Without this, a store with automatic compaction off stops on L0 and never starts again, because nothing will compact L0, and ST5 fails. RocksDB's `GetWriteStallConditionAndCause` has the check *(checked)*.
+
+(b) The Write Stalls page lists the L0 slowdown and stop triggers, but never says what happens when a user sets them below the compaction trigger. DB1 raises the slowdown trigger to at least the compaction trigger, and the stop trigger to at least the slowdown trigger. Without this, writes stop at fewer L0 files than it takes to start a compaction, so the stop never ends and ST5 fails. RocksDB's `SanitizeOptions` does the raising *(checked)*.
+
+(c) The MANIFEST page lists the fields a record may hold, but never says that every record carries the last sequence number and the next file number. DB4, DB7 and DB9 write them with every change. An ingested file's sequence number is in no log, so without this, recovery can hand out that number again, two versions of a key tie, and ST4 fails. RocksDB's `LogAndApplyHelper` sets both fields on every edit *(checked)*.
+
+(d) The MANIFEST page says each change is one record, but never says that the record is synced before the change is used in memory. DB7 syncs first and applies second. Without this, the purge can delete a compaction's inputs while the MANIFEST on disk still lists them, a crash then finds files missing, and ST2 fails. RocksDB's `ProcessManifestWrites` writes and syncs before it applies *(checked)*.
+
+(e) The Delete Stale Files page explains how running jobs protect their new files, but never says that ingestion needs the same protection. DB9 adds the ingested file's number to `T.pending` until its record is applied. Without this, a full purge that runs while the file is copied in but not yet recorded deletes it, and the ingestion records a file that is gone. *(unchecked)*
+
+(f) No page says that recovery moves the next file number past every file on disk, orphans included. DB1 sets it to one more than the largest number it finds, if that is larger than the MANIFEST's. Without this, a new file can take the number of an orphan that a crashed job left, and a hard link made by ingestion fails because the name exists. RocksDB's `MaybeUpdateNextFileNumber` does it *(checked)*.
+
+(g) The Creating and Ingesting SST Files page says ingestion stops writes and flushes an overlapping memtable, but never says what happens to recent writes still in an unsynced log. DB9 syncs the logs before the file is recorded. Without this, a power failure keeps the ingested file, which is durable at once, and loses older writes from the log, so the store comes back in a state it never had and ST1 fails. RocksDB itself does not sync here (`DBImpl::IngestExternalFiles`) *(checked)*, so this is also a gap in RocksDB.
+
+(h) No page says how far a crash keeps the store's history. A synced write is safe once its log is synced, a flushed or compacted file once its MANIFEST record is synced, and an ingested file at once. DB0 keeps one number for this, `persistedThrough`, and ST1 says every crash keeps a prefix that reaches it. Without one rule, each path is safe on its own, and the mix of paths is not, as (g) shows.
+
+(i) The Write Stalls page says writes stop when there are too many memtables, but never says which memtables count. LSM12 counts only the sealed memtables waiting to flush, and stops when they reach `max_write_buffer_number`. The option's own comment reads as if the active memtable counted too. RocksDB counts only the sealed ones *(checked)*.
+
+The items marked *(unchecked)* rest on what we know of the RocksDB code and should be checked against its source. The items marked *(checked)* were confirmed by reading the RocksDB source, not by running it.
