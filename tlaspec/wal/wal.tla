@@ -1,42 +1,74 @@
 ------------------------------ MODULE wal ------------------------------
+EXTENDS Naturals, FiniteSets
 
-EXTENDS Naturals, Sequences 
+CONSTANTS CF, MaxWrites, DelayImm, MaxImm, BufStop, FixNoSlowdown
 
-CONSTANTS MAXWRITES,
-          MAXLOGS
+VARIABLES Q, uid, imm, memUsed, seen
 
-Logs == 1..MAXLOGS
+vars == <<Q, uid, imm, memUsed, seen>>
 
-VARIABLES logs, lstate, active, nextSeq 
+--------------------------------------------------------------------------
 
-vars == << logs, lstate, active, nextSeq >>
+\* The two stall states
+TStallState == IF \E c \in CF : imm[c] >= MaxImm THEN "Stop"
+               ELSE IF \E c \in CF : imm[c] >= DelayImm THEN "Delay"
+               ELSE "Go"
+
+BStallState == IF BufStop > 0 /\ memUsed >= BufStop THEN "Stop" ELSE "Go"
 
 Init ==
-       /\ logs = [l \in Logs |-> <<>>]
-       /\ lstate = [l \in Logs |-> IF l = 1 THEN "Active" ELSE "Unused"]
-       /\ active = 1
-       /\ nextSeq = 1
-       
-AppendWrite == 
-       /\ nextSeq <= MAXWRITES
-       /\ logs' = [logs EXCEPT ![active] = Append(@, nextSeq)]
-       /\ nextSeq' = nextSeq + 1 
-       /\ UNCHANGED <<lstate, active>>
+      /\ Q = {}
+      /\ uid = 0
+      /\ imm = [c \in CF |-> 0]
+      /\ memUsed = 0
+      /\ seen = {}
+--------------------------------------------------------------------------
 
+Admit(c, sync, disableWAL, noslowdown) ==
+      /\ uid < MaxWrites
+      /\ disableWAL => ~sync
+      /\ LET u == TStallState
+             v == BStallState
+         IN  /\ \/ u = "Go" /\ v = "Go"
+                \/ u = "Delay" /\ v = "Go" /\ (FixNoSlowdown => ~noslowdown)
+             /\ seen' = seen \cup {[ns |-> noslowdown, u |-> u, v |-> v]}
+      /\ uid' = uid + 1
+      /\ Q' = Q \cup {[id |-> uid + 1, c |-> c, sync |-> sync, disableWAL |-> disableWAL,
+                       st |-> "Admitted", s |-> 0, lg |-> 0]}
+      /\ UNCHANGED <<imm, memUsed>>
 
-Next == AppendWrite 
+EnvFreeze(c) == /\ imm[c] < MaxImm
+                /\ imm' = [imm EXCEPT ![c] = @ + 1]
+                /\ UNCHANGED <<Q, uid, memUsed, seen>>
 
-Spec == Init /\ [] [Next]_vars 
+EnvFlush(c) == /\ imm[c] > 0
+               /\ imm' = [imm EXCEPT ![c] = @ - 1]
+               /\ UNCHANGED <<Q, uid, memUsed, seen>>
 
-RECURSIVE Concat(_)
-Concat(n) == IF n = 0 THEN <<>> ELSE Concat(n - 1) \o logs[n]
+EnvMemUp ==  /\ memUsed < BufStop
+             /\ memUsed' = memUsed + 1
+             /\ UNCHANGED <<Q, uid, imm, seen>>
 
-LogOrdered == LET all == Concat(MAXLOGS) IN \A i \in 1..Len(all) : all[i] = i
+EnvMemDown == /\ memUsed > 0
+              /\ memUsed' = memUsed - 1
+              /\ UNCHANGED <<Q, uid, imm, seen>>
 
-OneActive == \A l \in Logs : (lstate[l] = "Active") <=> (l = active)
+Next == \/ \E c \in CF, sync, disableWAL, noslowdown \in BOOLEAN : Admit(c, sync, disableWAL, noslowdown)
+        \/ \E c \in CF : EnvFlush(c) \/ EnvFreeze(c)
+        \/ EnvMemUp \/ EnvMemDown
 
-LogShape == \A l \in Logs :
-              /\ l < active => lstate[l] = "Closed"
-              /\ l > active => lstate[l] = "Unused" /\ logs[l] = <<>>
+Spec == Init /\ [][Next]_vars
+--------------------------------------------------------------------------
+
+TypeOK ==
+       /\ uid \in 0..MaxWrites
+       /\ imm \in [CF -> 0..MaxImm]
+       /\ \A q \in Q : q.st = "Admitted"
+
+NeverAdmitUnderStop == \A x \in seen : x.u # "Stop" /\ x.v # "Stop"
+
+NoSlowdownNeverWaits == \A x \in seen : x.ns => (x.u = "Go" /\ x.v = "Go")
+
+UniqueIds == \A p, q \in Q : p.id = q.id => p = q
 
 =============================================================================
