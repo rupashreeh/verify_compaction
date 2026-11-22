@@ -2,7 +2,7 @@
 
 ## Reference
 
-[RocksDB wiki: Write-Ahead Log (WAL)](https://github.com/meta/rocksdb/wiki/Write-Ahead-Log-%28WAL%29)
+[RocksDB wiki: Write-Ahead Log (WAL)](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-%28WAL%29)
 
 ## Problem
 
@@ -33,7 +33,7 @@ disk (Algorithm WAL3a and WAL3b).
 (d) The write is inserted into the memtable and then made visible to readers, and the client receives
 the response (Algorithm WAL4a and WAL4b).
 
-(e) When the memtable is full or memory is tight, a flush is triggered (Algorithm WAL1). When the
+(e) When the memtable is full, or the write buffer manager says memtables use too much memory, a flush is triggered (Algorithm WAL1). When the
 shared log has grown past its size limit, a flush is triggered too (Algorithm WAL5).
 
 (f) The memtable is frozen, a fresh one takes its place, and a new log file is started at the same
@@ -69,8 +69,18 @@ full, and asks whether it is empty.
 An **SSTable** is an on-disk sorted file. The WAL never builds one. It only asks, during recovery,
 for the largest sequence number an SST contains.
 
-The **WriteBufferManager** (written B) watches the total memory used by all memtables. It can ask
-for a flush when memory is tight, and it can ask writers to stall.
+The **WriteBufferManager** (written B) watches the total memory used by all memtables, across every
+column family of one or more stores. It keeps two counts: u, the memory of every memtable not yet
+freed, and a, the part of it in memtables that still take writes. β is its limit. WAL1 asks it three
+things:
+
+- `B.ShouldFlush()`: true when a > 7β/8, or when u ≥ β and a ≥ β/2.
+- `B.PickVictims(T)`: the column family to flush. By default it is the one whose mutable memtable is
+  oldest, skipping empty memtables and column families already being flushed.
+- `B.StallState()`: Stop when `allow_stall` is on and u ≥ β, or a stall is already on; Go otherwise.
+
+The memtables keep B's counts right: they report each new arena allocation, each seal, and each
+destroy (contracts K5 to K7, in the [write buffer manager README](../../write_buffer/README.md)).
 
 The **BlockCache** caches file blocks for reads. The WAL does not use it at all.
 
@@ -208,9 +218,7 @@ and each call links to its algorithm.
 | WAL8a.pdf  | `MarkObsolete(; T)` | Marks closed log files below MinLogToKeep obsolete |
 | WAL8b.pdf  | `DisposeLog(ℓ)` | Archives, recycles, or deletes an obsolete log file |
 | WAL9.pdf | `Recover(θ; T)` | Replays the needed log files after a crash |
-
-
-## Document underspecification in the Wiki: 
+## Document underspecification in the Wiki:
 
 (a) The wiki never says that every logged write must reach its memtable before that memtable is frozen and a new log starts. WAL5 waits until every logged write is in its memtable, and only then calls SwitchMemtable. Without the wait, a write can be in the old log but land in the new memtable; once the old log is deleted, a crash loses a write the client was told was saved.
 

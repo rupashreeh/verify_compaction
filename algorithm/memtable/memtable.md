@@ -181,24 +181,22 @@ c a column family, k a key, s a sequence number, F a file, and h a handle.
 
 ## Invariants
 
-The invariants are named MS1 to MS7
+The invariants are named MS1 to MS7, as in the TLA+ model (tla/MemSST.tla). The MS prefix keeps them apart from the WAL's I1 to I7.
 
-- **MS3** In the order a read checks things (memtable, frozen memtables, L0
-  newest first, then L1, L2, ...), a later place never holds a newer version of a key than an earlier
-  place. Compaction relies on this when it merges files as it keeps the version with the highest
-  sequence number. If this rule broke, a merge could keep an old value. 
-- **MS6** In L1 and deeper, files in the same level never overlap. Compaction relies on
-  this to pick its input files by key range. 
-- **MS7** N_c never moves past a log file that an unflushed memtable of c still
-  needs. This decides which log files stay live. Live log files count toward `max_total_wal_size`, so
-  this decides when WAL pressure forces small, early flushes, and so when small L0 files appear. 
+These three shape the files compaction receives:
 
-The other four invariants are about what readers see, and they do not change the files compaction
-receives. A read returns the latest committed value (MS1). A snapshot keeps showing what was committed
-when it was taken (MS2). A batch across column families is visible in all of them or in none (MS4). An
-ingestion lands in all of its column families or in none (MS5).
+- **MS3, newer above older.** A read always meets the newer version of a key before an older one.
+- **MS6, sorted levels.** In L1 and deeper, files in the same level never overlap.
+- **MS7, safe log numbers.** N_c never moves past a log file that an unflushed memtable of c still needs.
 
-## Underspecifications in the wiki
+These four are about what readers see, and do not change the files compaction receives:
+
+- **MS1, latest value.** A read returns the latest committed value.
+- **MS2, stable snapshots.** A snapshot keeps showing what was committed when it was taken.
+- **MS4, atomic batches.** A batch across column families is visible in all of them or in none.
+- **MS5, atomic ingestion.** An ingestion lands in all of its column families or in none.
+
+## Document underspecification in the Wiki:
 
 (a) The wiki says a full memtable "becomes immutable and replaced by a new memtable", but never says when, or that the swap must wait for writes still being inserted. MT4 runs only from WAL6a, at the start of the next write, after every logged write is in its memtable. Without the wait, a late write lands in the new memtable behind a newer one, and a read returns the old value.
 
@@ -206,11 +204,11 @@ ingestion lands in all of its column families or in none (MS5).
 
 (c) The wiki says reads check the memtable before SST files, but never says how long a frozen memtable keeps answering reads. MT7 keeps reading it until MT6 has installed its SST file in L0, not just written it. Without this, there is a moment when the data is in neither place a reader looks, and a read misses it.
 
-(d) The wiki says that when all memtables together pass db_write_buffer_size, "the largest memtable will be flushed", while the RocksDB code (HandleWriteBufferManagerFlush) seems to flush the column family with the oldest memtable. Our spec follows the code: WAL1 asks the write buffer manager for the oldest one and freezes it through MT4. Both choices are safe, but they free memory at different speeds and produce different L0 files, so a reader of the wiki predicts the wrong flushes. (unchecked)
+(d) The wiki says that when all memtables together pass db_write_buffer_size, "the largest memtable will be flushed", while the RocksDB code (HandleWriteBufferManagerFlush) seems to flush the column family with the oldest memtable. Our spec follows the code: WAL1 asks the write buffer manager for the oldest one and freezes it through MT4. Both choices are safe, but they free memory at different speeds and produce different L0 files, so a reader of the wiki predicts the wrong flushes. *(unchecked)*
 
 (e) The wiki says an old log file can be deleted only when all column families have flushed its data, but never says how the store knows which logs a column family still needs. MT6 moves the column family's log number N_c forward in the same MANIFEST update that installs the flush. If the two are saved separately, a crash in between either deletes a log whose writes are in no SST file, or replays writes that are already in one.
 
-(f) The wiki says a dropped column family's data is deleted only when its last handle is released, but never says whether, until then, it keeps old log files alive or still gets flushed. CF2 stops counting the dropped column family when finding the oldest log to keep, and never flushes it again. Without this rule, one dropped column family can keep every log file alive and hold WAL pressure high until the handle is released. (unchecked)
+(f) The wiki says a dropped column family's data is deleted only when its last handle is released, but never says whether, until then, it keeps old log files alive or still gets flushed. CF2 stops counting the dropped column family when finding the oldest log to keep, and never flushes it again. Without this rule, one dropped column family can keep every log file alive and hold WAL pressure high until the handle is released. *(unchecked)*
 
 (g) The wiki says ingestion flushes the memtable if the file's key range overlaps it, but never says that frozen memtables count too, or that ingestion must wait until the flush is installed. SST2 freezes and flushes every overlapping memtable through WAL6a and WAL6b, and waits for MT6 before it picks a level. Without this, the ingested file lands below an older value still in memory, and a read returns the old value.
 
@@ -218,4 +216,10 @@ ingestion lands in all of its column families or in none (MS5).
 
 (i) The wiki says writes are blocked during ingestion so the right sequence number can be picked, but never says the block must also wait for writes already in progress. SST2 waits until every logged write is visible to readers before SST4 commits. Without the wait, readers can see part of a batch that spans several column families, so the batch is not all or nothing.
 
-(j) The wiki says IngestExternalFiles is all or nothing across column families, but never says how. SST4 records every file in one MANIFEST update, and readers see all of them at the same moment. Without this, a crash or a reader can find the files in some column families but not in others
+(j) The wiki says IngestExternalFiles is all or nothing across column families, but never says how. SST4 records every file in one MANIFEST update, and readers see all of them at the same moment. Without this, a crash or a reader can find the files in some column families but not in others.
+
+(k) The wiki says a file goes to the lowest level it "can fit" in, but never says what "fit" means. SST3 reads it as: the file's key range falls between the level's existing files, so the files of that level still never overlap. Without a clear rule, a file could overlap others in its level, and a search that picks one file per level by key range would miss data. *(unchecked)*
+
+(l) The wiki says ingest_behind puts files at the bottom level with sequence number 0, but never says what this asks of compaction. SST3 places such a file in the bottom level, which compaction must keep free for it, and compaction may never drop a deletion because older data can still arrive below it. Without this, a later ingest-behind file can bring deleted keys back. *(unchecked)*
+
+The items marked *(unchecked)* rest on what we know of the RocksDB code and should be checked against its source.
