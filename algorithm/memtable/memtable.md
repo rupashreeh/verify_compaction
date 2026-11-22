@@ -181,23 +181,41 @@ c a column family, k a key, s a sequence number, F a file, and h a handle.
 
 ## Invariants
 
-The invariants are named MS1 to MS7, as in the TLA+ model (tla/MemSST.tla). The MS prefix keeps them apart from the WAL's I1 to I7. Three of them matter for compaction. Each one shapes the files compaction receives.
+The invariants are named MS1 to MS7
 
-- **MS3, newer above older.** In the order a read checks things (memtable, frozen memtables, L0
+- **MS3** In the order a read checks things (memtable, frozen memtables, L0
   newest first, then L1, L2, ...), a later place never holds a newer version of a key than an earlier
-  place. Compaction relies on this when it merges files: it keeps the version with the highest
-  sequence number. If this rule broke, a merge could keep an old value. Keeping it has a cost: a freeze
-  waits for writes still being inserted, finished flushes wait to be installed oldest first, and an
-  ingested file may force a flush or need a new sequence number.
-- **MS6, sorted levels.** In L1 and deeper, files in the same level never overlap. Compaction relies on
-  this to pick its input files by key range. Keeping it has a cost: an ingested file that does not fit
-  in a deep level goes higher up, often to L0, which adds L0 files.
-- **MS7, safe log numbers.** N_c never moves past a log file that an unflushed memtable of c still
+  place. Compaction relies on this when it merges files as it keeps the version with the highest
+  sequence number. If this rule broke, a merge could keep an old value. 
+- **MS6** In L1 and deeper, files in the same level never overlap. Compaction relies on
+  this to pick its input files by key range. 
+- **MS7** N_c never moves past a log file that an unflushed memtable of c still
   needs. This decides which log files stay live. Live log files count toward `max_total_wal_size`, so
-  this decides when WAL pressure forces small, early flushes, and so when small L0 files appear. It has
-  no run-time cost.
+  this decides when WAL pressure forces small, early flushes, and so when small L0 files appear. 
 
 The other four invariants are about what readers see, and they do not change the files compaction
 receives. A read returns the latest committed value (MS1). A snapshot keeps showing what was committed
 when it was taken (MS2). A batch across column families is visible in all of them or in none (MS4). An
 ingestion lands in all of its column families or in none (MS5).
+
+## Underspecifications in the wiki
+
+(a) The wiki says a full memtable "becomes immutable and replaced by a new memtable", but never says when, or that the swap must wait for writes still being inserted. MT4 runs only from WAL6a, at the start of the next write, after every logged write is in its memtable. Without the wait, a late write lands in the new memtable behind a newer one, and a read returns the old value.
+
+(b) The wiki says a background thread flushes the memtable, but never says in what order finished flushes are installed. MT6 installs them strictly oldest first, so a newer flush waits for an older one. Without this, N_c moves past a log file that an older, still unflushed memtable needs, and once that log is deleted a crash loses its writes.
+
+(c) The wiki says reads check the memtable before SST files, but never says how long a frozen memtable keeps answering reads. MT7 keeps reading it until MT6 has installed its SST file in L0, not just written it. Without this, there is a moment when the data is in neither place a reader looks, and a read misses it.
+
+(d) The wiki says that when all memtables together pass db_write_buffer_size, "the largest memtable will be flushed", while the RocksDB code (HandleWriteBufferManagerFlush) seems to flush the column family with the oldest memtable. Our spec follows the code: WAL1 asks the write buffer manager for the oldest one and freezes it through MT4. Both choices are safe, but they free memory at different speeds and produce different L0 files, so a reader of the wiki predicts the wrong flushes. (unchecked)
+
+(e) The wiki says an old log file can be deleted only when all column families have flushed its data, but never says how the store knows which logs a column family still needs. MT6 moves the column family's log number N_c forward in the same MANIFEST update that installs the flush. If the two are saved separately, a crash in between either deletes a log whose writes are in no SST file, or replays writes that are already in one.
+
+(f) The wiki says a dropped column family's data is deleted only when its last handle is released, but never says whether, until then, it keeps old log files alive or still gets flushed. CF2 stops counting the dropped column family when finding the oldest log to keep, and never flushes it again. Without this rule, one dropped column family can keep every log file alive and hold WAL pressure high until the handle is released. (unchecked)
+
+(g) The wiki says ingestion flushes the memtable if the file's key range overlaps it, but never says that frozen memtables count too, or that ingestion must wait until the flush is installed. SST2 freezes and flushes every overlapping memtable through WAL6a and WAL6b, and waits for MT6 before it picks a level. Without this, the ingested file lands below an older value still in memory, and a read returns the old value.
+
+(h) The wiki says the ingested file gets a global sequence number, but never says which one. SST3 gives it the next sequence number if it overlaps existing data or a snapshot is open, and 0 otherwise. Without this rule, the file can look older than the data it replaces, so a read returns the old value, or a snapshot taken before the ingestion starts to see the new file.
+
+(i) The wiki says writes are blocked during ingestion so the right sequence number can be picked, but never says the block must also wait for writes already in progress. SST2 waits until every logged write is visible to readers before SST4 commits. Without the wait, readers can see part of a batch that spans several column families, so the batch is not all or nothing.
+
+(j) The wiki says IngestExternalFiles is all or nothing across column families, but never says how. SST4 records every file in one MANIFEST update, and readers see all of them at the same moment. Without this, a crash or a reader can find the files in some column families but not in others
