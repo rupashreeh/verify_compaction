@@ -7,18 +7,28 @@
 - [RocksDB wiki: Creating and Ingesting SST files](https://github.com/facebook/rocksdb/wiki/Creating-and-Ingesting-SST-files)
 
 
-## Problem 
-The main reasons a key value store built using an LSM tree splits its data between memory and disk is to ensure durability and speed. Updating each key in place on the disk would be a random write for each update which is extremely slow. So the key value store batches the writes as one large sorted file and writes it to the disk. This impacts the cost of reads as the key may be in memory or in any of the several files. 
+## Problem
+The main reason a key-value store built using an LSM tree splits its data between memory and disk is to ensure durability and speed. Updating each key in place on the disk would be a random write for each update which is extremely slow. So the key value store batches the writes as one large sorted file and writes it to the disk. This impacts the cost of reads as the key may be in memory or in any of the several files. 
 
 The part of the data that is in memory is kept as a sorted buffer and is called the MemTable. Every new write goes into it, and every read checks it first, because it holds the newest data. When it is full (write_buffer_size, 64 MB by default), it is frozen. A frozen memtable takes no more writes but still answers reads. A new, empty memtable takes its place in the same step as the freeze, so there is always exactly one memtable taking writes.
 
 The freeze does not happen the instant the memtable fills up. The write that fills it only marks it as full. The freeze happens at the start of the next write, before that write is logged. It also waits until every write already logged has been inserted into a memtable. Otherwise a late write could land in the new memtable, in front of a newer one.
 
-The part of the data that is on the desk is a file of key–value pairs in key order which never changes once written and is called the SSTable. It has an index and a Bloom filter, so a lookup reads only a few blocks. Writing a frozen memtable to a new SST file is called a flush. New SST files go into level 0 (L0). Compaction later merges them into deeper levels L1, L2, and so on. An SST file can also be built outside the store and brought in directly. This is called ingestion. 
+The part of the data that is on the disk is a file of key–value pairs in key order which never changes once written and is called the SSTable. It has an index and a Bloom filter, so a lookup reads only a few blocks. Writing a frozen memtable to a new SST file is called a flush. New SST files go into level 0 (L0). Compaction later merges them into deeper levels L1, L2, and so on. An SST file can also be built outside the store and brought in directly. This is called ingestion. 
 
 Each write gets a sequence number that says how new it is. Newer data always sits above older data. A read checks the memtable, then the frozen memtables, then L0, then each deeper level, and stops at the first version it finds. Compaction depends on the same rule.
 
-A memtable lives in memory, so a crash would lose every write that has not been flushed yet. The write-ahead log (WAL) fixes this. Each write goes to a log file on disk before it goes into the memtable. If the store crashes, it replays the log to rebuild the memtables. Once a memtable has been flushed to an SST, its log records are no longer needed, and old log files can be deleted. The WAL is specified separately (algorithm/wal/wal.md)
+A memtable lives in memory, so a crash would lose every write that has not been flushed yet. The write-ahead log (WAL) fixes this. Each write goes to a log file on disk before it goes into the memtable. If the store crashes, it replays the log to rebuild the memtables. Once a memtable has been flushed to an SST, its log records are no longer needed, and old log files can be deleted. The WAL is specified separately (algorithm/wal/wal.md). This file uses these of its steps:
+
+| WAL step | What it does |
+|---|---|
+| WAL1 | Admits a write. At this point it checks whether a memtable is full, or all memtables are too big, and starts a freeze. |
+| WAL4a | Inserts logged writes into the memtables (MT1). |
+| WAL5 | Checks WAL pressure: if the live log files are over `max_total_wal_size`, it flushes the column families that hold the oldest log. |
+| WAL6a | Freezes the chosen memtables (MT4) and starts a new log file. |
+| WAL6b | Asks a background job to flush the frozen memtables (MT5). |
+| WAL7a, WAL7b | Run just before and just after a flush is recorded in the MANIFEST (MT6). WAL7a syncs the old logs still needed; WAL7b marks the flush done. |
+| WAL8a | Marks log files that no column family needs any more, so they can be deleted. |
 
 
 ## System Model
@@ -29,7 +39,7 @@ The MANIFEST is a file that records which column families and SST files exist, e
 
 A memtable (M) is a sorted buffer in memory. It can insert, look up a key, and say whether it is full or empty.
 
-The WAL is the log described in algorithm/wal/wal.md
+The WAL is the log described in algorithm/wal/wal.md.
 
 ## Memtable Life Cycle
 
@@ -72,7 +82,7 @@ stateDiagram-v2
 
 | Trigger | Detected by | What is flushed |
 |---|---|---|
-| A memtable is full (`write_buffer_size`) | MT3, called in WAL4a | that column family |
+| A memtable is full (`write_buffer_size`) | MT3, asked by WAL1 at the start of the next write | that column family |
 | All memtables together are over `db_write_buffer_size` | the write buffer manager, in WAL1 | the column family with the oldest memtable |
 | The log files are over `max_total_wal_size` | WAL5 | every column family that needs the oldest log file |
 | The user calls `Flush` | the user | the named column families |
@@ -152,18 +162,18 @@ c a column family, k a key, s a sequence number, F a file, and h a handle.
 
 | Algorithm | Procedure | What it does |
 |---|---|---|
-| MT1 | `M.Insert(r)` | Adds a write to the memtable (called by WAL4a) |
-| MT2 | `M.Get(k, s)` | Finds the newest version of a key in one memtable |
-| MT3 | `M.ShouldFlush()`, `M.IsEmpty()` | Says whether the memtable is full, or empty |
+| MT1 | `Insert(M, r)` | Adds a write to the memtable (called by WAL4a) |
+| MT2 | `MemGet(M, k, s)` | Finds the newest version of a key in one memtable |
+| MT3 | `ShouldFlush(M)`, `IsEmpty(M)` | Says whether the memtable is full, or empty |
 | MT4 | `T.SealMutable(c, n)` | Freezes the memtable and starts a new one (called only by WAL6a) |
 | MT5 | `T.FlushJob(c)` | Writes frozen memtables to an L0 SST file |
 | MT6 | `T.InstallFlush(c)` | Installs finished flushes in order and moves N_c forward |
 | MT7 | `T.Get(c, k, s)` | Reads a key: memtables first, then L0, then each level |
-| CF1 | `T.CreateColumnFamily(name, opts)` | Creates an empty column family |
+| CF1 | `T.CreateColumnFamily(c, opts)` | Creates an empty column family |
 | CF2 | `T.DropColumnFamily(h)` | Drops a column family; its data stays readable until CF3 |
 | CF3 | `T.ReleaseHandle(h)` | Deletes a dropped column family's data when the last handle goes |
-| CF4 | `Open(dir, descs, readOnly)` | Opens the store; read-write opens must list every column family |
-| CF5 | `T.NewIterators(hs, s)` | Iterates several column families at the same point in time |
+| CF4 | `Open(dir, descs)` | Opens the store; read-write opens must list every column family |
+| CF5 | `T.NewIterators(H, s)` | Iterates several column families at the same point in time |
 | SST1 | `SstFileWriter` | Writes an SST file outside the store |
 | SST2 | `T.IngestExternalFiles(args)` | Ingests files into one or more column families, all or nothing |
 | SST3 | `T.AssignLevelAndSeqno(c, F, s)` | Picks a file's level and sequence number |
@@ -171,7 +181,7 @@ c a column family, k a key, s a sequence number, F a file, and h a handle.
 
 ## Invariants
 
-Three invariants matter for compaction. Each one shapes the files compaction receives.
+The invariants are named MS1 to MS7, as in the TLA+ model (tla/MemSST.tla). The MS prefix keeps them apart from the WAL's I1 to I7. Three of them matter for compaction. Each one shapes the files compaction receives.
 
 - **MS3, newer above older.** In the order a read checks things (memtable, frozen memtables, L0
   newest first, then L1, L2, ...), a later place never holds a newer version of a key than an earlier
