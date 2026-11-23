@@ -1,11 +1,11 @@
 ------------------------------ MODULE wal ------------------------------
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS CF, MaxWrites, DelayImm, MaxImm, BufStop, FixNoSlowdown
+CONSTANTS CF, MaxWrites, DelayImm, MaxImm, BufStop, FixSeqAtAppend
 
-VARIABLES Q, uid, imm, memUsed, seen
+VARIABLES Q, uid, imm, memUsed, log, nextSeq
 
-vars == <<Q, uid, imm, memUsed, seen>>
+vars == <<Q, uid, imm, memUsed, log, nextSeq>>
 
 --------------------------------------------------------------------------
 
@@ -16,44 +16,60 @@ TStallState == IF \E c \in CF : imm[c] >= MaxImm THEN "Stop"
 
 BStallState == IF BufStop > 0 /\ memUsed >= BufStop THEN "Stop" ELSE "Go"
 
+Rec(q) == [kind |-> "W", s |-> q.s, c |-> q.c, id |-> q.id]
+
 Init ==
       /\ Q = {}
       /\ uid = 0
       /\ imm = [c \in CF |-> 0]
       /\ memUsed = 0
-      /\ seen = {}
+      /\ log = <<>>
+      /\ nextSeq = 1 
 --------------------------------------------------------------------------
-
+\*  WAL1 Admit
 Admit(c, sync, disableWAL, noslowdown) ==
       /\ uid < MaxWrites
       /\ disableWAL => ~sync
       /\ LET u == TStallState
              v == BStallState
          IN  /\ \/ u = "Go" /\ v = "Go"
-                \/ u = "Delay" /\ v = "Go" /\ (FixNoSlowdown => ~noslowdown)
-             /\ seen' = seen \cup {[ns |-> noslowdown, u |-> u, v |-> v]}
+                \/ u = "Delay" /\ v = "Go" /\  ~noslowdown
       /\ uid' = uid + 1
       /\ Q' = Q \cup {[id |-> uid + 1, c |-> c, sync |-> sync, disableWAL |-> disableWAL,
-                       st |-> "Admitted", s |-> 0, lg |-> 0]}
-      /\ UNCHANGED <<imm, memUsed>>
+                       st |-> "Admitted", s |-> IF FixSeqAtAppend THEN 0 ELSE nextSeq, lg |-> 0]}
+      /\ nextSeq' = IF FixSeqAtAppend THEN nextSeq ELSE nextSeq + 1
+      /\ UNCHANGED <<imm, memUsed, log>>
+
+\*  WAL1 AppendGroup
+AppendGroup(i) == \E q \in Q :
+    /\ q.id = i
+    /\ q \in Q /\ q.st = "Admitted"
+    /\ LET s  == IF FixSeqAtAppend THEN nextSeq ELSE q.s
+           q2 == [q EXCEPT !.s = s, !.lg = 1,
+                           !.st = IF q.disableWAL THEN "Unlogged" ELSE "Appended"]
+       IN  /\ Q' = (Q \ {q}) \cup {q2}
+           /\ log' = IF q.disableWAL THEN log ELSE Append(log, Rec(q2))
+    /\ nextSeq' = IF FixSeqAtAppend THEN nextSeq + 1 ELSE nextSeq
+    /\ UNCHANGED <<uid, imm, memUsed>>
 
 EnvFreeze(c) == /\ imm[c] < MaxImm
                 /\ imm' = [imm EXCEPT ![c] = @ + 1]
-                /\ UNCHANGED <<Q, uid, memUsed, seen>>
+                /\ UNCHANGED <<Q, uid, memUsed, log, nextSeq>>
 
 EnvFlush(c) == /\ imm[c] > 0
                /\ imm' = [imm EXCEPT ![c] = @ - 1]
-               /\ UNCHANGED <<Q, uid, memUsed, seen>>
+               /\ UNCHANGED <<Q, uid, memUsed, log, nextSeq>>
 
 EnvMemUp ==  /\ memUsed < BufStop
              /\ memUsed' = memUsed + 1
-             /\ UNCHANGED <<Q, uid, imm, seen>>
+             /\ UNCHANGED <<Q, uid, imm, log, nextSeq>>
 
 EnvMemDown == /\ memUsed > 0
               /\ memUsed' = memUsed - 1
-              /\ UNCHANGED <<Q, uid, imm, seen>>
+              /\ UNCHANGED <<Q, uid, imm, log, nextSeq>>
 
 Next == \/ \E c \in CF, sync, disableWAL, noslowdown \in BOOLEAN : Admit(c, sync, disableWAL, noslowdown)
+        \/ \E i \in 1..MaxWrites : AppendGroup(i)
         \/ \E c \in CF : EnvFlush(c) \/ EnvFreeze(c)
         \/ EnvMemUp \/ EnvMemDown
 
@@ -61,14 +77,11 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 
 TypeOK ==
-       /\ uid \in 0..MaxWrites
-       /\ imm \in [CF -> 0..MaxImm]
-       /\ \A q \in Q : q.st = "Admitted"
+    /\ log \in Seq([kind : {"W"}, s : Nat, c : CF, id : Nat])
+    /\ \A q \in Q : q.st \in {"Admitted", "Appended", "Unlogged"}
 
-NeverAdmitUnderStop == \A x \in seen : x.u # "Stop" /\ x.v # "Stop"
+LogInOrder == \A i, j \in 1..Len(log) : i < j => log[i].s < log[j].s
 
-NoSlowdownNeverWaits == \A x \in seen : x.ns => (x.u = "Go" /\ x.v = "Go")
-
-UniqueIds == \A p, q \in Q : p.id = q.id => p = q
+LogMatchesQ == \A q \in Q : (q.st = "Appended") <=> Rec(q) \in {log[i] : i \in 1..Len(log)}
 
 =============================================================================
