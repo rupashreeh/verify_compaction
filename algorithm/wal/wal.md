@@ -36,7 +36,8 @@ the response (Algorithm WAL4a and WAL4b).
 (e) When the memtable is full, or the write buffer manager says memtables use too much memory, a flush is triggered (Algorithm WAL1). When the
 shared log has grown past its size limit, a flush is triggered too (Algorithm WAL5).
 
-(f) The memtable is frozen, a fresh one takes its place, and a new log file is started at the same
+(f) The RocksDB store waits until every write already in the log has reached its memtable. Then the
+memtable is frozen, a fresh one takes its place, and a new log file is started at the same
 moment (Algorithm WAL6a). Then a flush of the frozen memtable is scheduled (Algorithm WAL6b).
 
 (g) A background job writes the frozen memtable to disk as an SST file.
@@ -176,9 +177,12 @@ flowchart TB
 When the RocksDB store opens after a crash, it reads the MANIFEST to learn which SST files exist and which
 log files each column family still needs. It then reads those log files in order, oldest first, and
 puts each write back into its memtable, skipping any write whose column family had already flushed
-it. In the default point-in-time mode, replay stops at the first damaged record, so the
-RocksDB store keeps everything before that point and drops everything after it. Before opening, it checks
-that no SST already holds data from beyond the stopping point, and refuses to open if one does.
+it. A missing log counts as a damaged record: each log's header names the log before it, so a gap
+shows. In the default point-in-time mode, replay stops at the first damaged record, so the
+RocksDB store keeps everything before that point and drops what follows. Replay starts again only if a
+later record carries on with the next sequence number, which means nothing was lost in between (an old
+torn record from an earlier crash, for example). Before opening, it checks that no SST already holds
+data from beyond the stopping point, and refuses to open if one does.
 Finally, it flushes the rebuilt memtables to SSTs (unless configured to keep them in memory), starts
 a new log file, retires the old ones, and opens for writes (Algorithm WAL9).
 
@@ -186,12 +190,15 @@ a new log file, retires the old ones, and opens for writes (Algorithm WAL9).
 flowchart TD
     S["The RocksDB store opens after a crash"] --> M["Read the MANIFEST: which SSTs exist<br/>and which log files each column family still needs"]
     M --> R["Read the needed log files in order, oldest first"]
-    R --> Q{"Is the next record<br/>intact?"}
+    R --> Q{"Is the next record intact,<br/>and is the log before it present?"}
     Q -- "yes" --> I["Put it back into its memtable<br/>(skip it if that column family already flushed it)"]
     I --> R
-    Q -- "damaged" --> P["Stop replaying: keep everything before this point,<br/>drop everything after it"]
+    Q -- "damaged or missing" --> P["Stop: keep everything before this point"]
+    P --> X{"Does a later record carry on with<br/>the next sequence number?"}
+    X -- "yes" --> I
+    X -- "no" --> C
     Q -- "no more records" --> C
-    P --> C{"Do the SSTs agree with<br/>where replay stopped?"}
+    C{"Do the SSTs agree with<br/>where replay stopped?"}
     C -- "no" --> F(["Refuse to open"])
     C -- "yes" --> L["Flush the rebuilt memtables to SSTs (unless configured to keep them),<br/>start a new log file, retire the old ones"]
     L --> O(["Open for writes"])
@@ -218,9 +225,10 @@ and each call links to its algorithm.
 | WAL8a.pdf  | `MarkObsolete(; T)` | Marks closed log files below MinLogToKeep obsolete |
 | WAL8b.pdf  | `DisposeLog(ℓ)` | Archives, recycles, or deletes an obsolete log file |
 | WAL9.pdf | `Recover(θ; T)` | Replays the needed log files after a crash |
+
 ## Document underspecification in the Wiki:
 
-(a) The wiki never says that every logged write must reach its memtable before that memtable is frozen and a new log starts. WAL5 waits until every logged write is in its memtable, and only then calls SwitchMemtable. Without the wait, a write can be in the old log but land in the new memtable; once the old log is deleted, a crash loses a write the client was told was saved.
+(a) The wiki never says that every logged write must reach its memtable before that memtable is frozen and a new log starts. WAL6a waits until every logged write is in its memtable before it freezes, so every caller (WAL1 and WAL5) gets the wait. Without the wait, a write can be in the old log but land in the new memtable; once the old log is deleted, a crash loses a write the client was told was saved.
 
 (b) The wiki never says that, with several column families, the older closed logs must be on disk before a flush is saved in the MANIFEST. WAL7a forces every closed log that is still needed onto disk just before the flush is saved. Without it, a power failure can leave one column family holding a batch that the other column families have lost, which breaks the promise that a batch is all or nothing.
 
@@ -236,4 +244,13 @@ and each call links to its algorithm.
 
 (h) The wiki doesn’t say what happens when replay stops early but an SST file already holds newer data. WAL9 returns an error in that case, because the column families would no longer agree on a single point in time. Without the check, the RocksDB store opens with column families at different points in time and gives no error.
 
-(i) The wiki doesn’t say how to tell a stale record left in a recycled log file from a damaged tail. Our WAL9 doesn’t separate them either: it treats such a record as damaged and lets the recovery mode decide. Getting this wrong either brings old data back as if it were new, or treats a healthy log as corrupt, which drops writes or makes the open fail.
+(i) The wiki doesn’t say how to tell a stale record left in a recycled log file from a damaged tail. Our WAL9 doesn’t separate them either: it treats such a record as damaged and lets the recovery mode decide. TLC shows this is safe under point-in-time recovery, because replay resumes in the next log. Getting this wrong either brings old data back as if it were new, or treats a healthy log as corrupt, which drops writes or makes the open fail.
+
+## Gaps TLC found in our own algorithms (now fixed)
+
+
+(a) WAL1 froze a memtable without waiting for logged writes to reach their memtables; only WAL5 waited. A write could then sit in the old log but land in the new memtable, and be lost once the old log was dropped. The wait is now in WAL6a.
+
+(b) WAL9 did not notice a missing log. If a log in the middle vanished, replay skipped the gap and kept the writes after it. WAL9 now treats a missing log as a damaged record. RocksDB has the same gap unless track_and_verify_wals is on, and it is off by default.
+
+(c) WAL9 never resumed after a stop. After two crashes, an old torn record from the first one made replay stop early and drop newer writes the client was told were saved. WAL9 now resumes when a record carries on with the next sequence number.
